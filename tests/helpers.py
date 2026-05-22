@@ -308,7 +308,8 @@ class FakeOmxRunner:
         return None
 
     def close_session(self, runtime_handle: str) -> None:
-        self.closed_sessions.append(runtime_handle)
+        if runtime_handle not in self.closed_sessions:
+            self.closed_sessions.append(runtime_handle)
 
     def get_session_id(self, runtime_handle: str) -> str | None:
         del runtime_handle

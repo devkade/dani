@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -22,6 +24,7 @@ class OmxRunner:
         self.run_dir = run_dir
         self.sessions_root = sessions_root or (Path.home() / ".codex" / "sessions")
         self._processes: dict[str, tuple[ManagedProcess, TextIO, TextIO]] = {}
+        self._process_groups: dict[str, int] = {}
         self._lock = threading.RLock()
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -49,6 +52,7 @@ class OmxRunner:
         )
         with self._lock:
             self._processes[process_handle] = (process, stdout_file, stderr_file)
+            self._remember_process_group(process_handle, process)
         omx_session_id = None
         if job.stage in {"issue_request", "issue_followup"}:
             omx_session_id = self._capture_omx_session_id(repo_path=repo_path, prompt=prompt, started_at=started_at)
@@ -94,6 +98,7 @@ class OmxRunner:
         )
         with self._lock:
             self._processes[process_handle] = (process, stdout_file, stderr_file)
+            self._remember_process_group(process_handle, process)
         return SessionRecord(
             repo_full_name=job.repo_full_name,
             stage=job.stage,
@@ -143,6 +148,7 @@ class OmxRunner:
         try:
             process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
+            self.close_session(runtime_handle)
             msg = f"omx exec process did not exit before timeout: {runtime_handle}"
             raise TimeoutError(msg) from exc
 
@@ -159,20 +165,47 @@ class OmxRunner:
     def close_session(self, runtime_handle: str) -> None:
         with self._lock:
             entry = self._processes.pop(runtime_handle, None)
+            process_group_id = self._process_groups.pop(runtime_handle, None)
         if entry is None:
             return
         process, stdout_file, stderr_file = entry
         try:
-            if process.poll() is None:
+            if process_group_id is not None:
+                self._signal_process_group(process_group_id, signal.SIGTERM)
+            elif process.poll() is None:
                 process.terminate()
+            if process.poll() is None:
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    process.kill()
+                    if process_group_id is None:
+                        process.kill()
+                    else:
+                        self._signal_process_group(process_group_id, signal.SIGKILL)
                     process.wait(timeout=5)
         finally:
             stdout_file.close()
             stderr_file.close()
+
+    def _remember_process_group(self, runtime_handle: str, process: ManagedProcess) -> None:
+        process_group_id = self._process_group_id(process)
+        if process_group_id is not None:
+            self._process_groups[runtime_handle] = process_group_id
+
+    def _process_group_id(self, process: ManagedProcess) -> int | None:
+        process_id = getattr(process, "pid", None)
+        if not isinstance(process_id, int):
+            return None
+        try:
+            return os.getpgid(process_id)
+        except OSError:
+            return None
+
+    def _signal_process_group(self, process_group_id: int, signal_number: int) -> None:
+        try:
+            os.killpg(process_group_id, signal_number)
+        except ProcessLookupError:
+            return
 
     def get_session_id(self, runtime_handle: str) -> str | None:
         del runtime_handle

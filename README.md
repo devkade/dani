@@ -16,6 +16,8 @@ opt-in)**.
   - issue request report
   - `/approve` implementation
   - 3 review rounds for agent-authored PRs
+  - PR-comment-triggered merge conflict resolution via `/resolve-conflict`,
+    `/resolve merge conflict`, `/solve merge conflict`, or `solve merge conflict`
   - external contributor account-age eligibility checks
   - event-driven, duplicate-delivery-safe re-review for external contributor PRs
   - final verdict + auto-merge on APPROVE

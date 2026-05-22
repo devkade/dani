@@ -1853,6 +1853,52 @@ def test_merge_conflict_resolution_comment_queues_final_verdict_retry(tmp_path: 
     assert omx_runner.launches[-1]["job"].stage == "final_verdict"
 
 
+def test_pr_comment_keyword_queues_merge_conflict_resolution(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    github.add_pull_request(
+        "acme/demo",
+        77,
+        "Implements #5\n<!-- dani:stage=implementation;job=impl-1;issue=5 -->",
+        title="Feature/#5",
+        head_branch="Feature/#5",
+        base_branch="dev",
+    )
+
+    result = service.handle_event(make_pr_comment_event(pr_number=77, body="solve merge conflict", actor_login="acme"))
+    service.wait_for_idle()
+
+    resolution_jobs = service.storage.find_jobs(
+        repo_full_name="acme/demo", stage="merge_conflict_resolution", pr_number=77
+    )
+    assert result["stage"] == "merge_conflict_resolution"
+    assert resolution_jobs
+    assert resolution_jobs[0].issue_number == 5
+    assert resolution_jobs[0].metadata["head_branch"] == "Feature/#5"
+    assert resolution_jobs[0].metadata["base_branch"] == "dev"
+    assert omx_runner.launches[-1]["job"].stage == "merge_conflict_resolution"
+
+
+def test_pr_comment_keyword_requires_authorized_user(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    github.add_pull_request(
+        "acme/demo",
+        77,
+        "Implements #5\n<!-- dani:stage=implementation;job=impl-1;issue=5 -->",
+        title="Feature/#5",
+        head_branch="Feature/#5",
+        base_branch="dev",
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(pr_number=77, body="/resolve-conflict", actor_login="outside-user")
+    )
+    service.wait_for_idle()
+
+    assert result == {"status": "ignored", "reason": "approver_not_authorized"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="merge_conflict_resolution", pr_number=77) == []
+    assert omx_runner.launches == []
+
+
 def test_duplicate_merge_conflict_resolution_event_is_ignored(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
     github.add_pull_request(

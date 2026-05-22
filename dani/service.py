@@ -285,6 +285,9 @@ class DaniService:
         if event.kind == "issue_comment":
             return self._dispatch_issue_followup_comment(repo, event)
 
+        if event.kind == "pull_request_comment" and self._is_merge_conflict_resolution_request(event.body):
+            return self._dispatch_merge_conflict_resolution_request(repo, event)
+
         if event.kind == "pull_request_opened":
             return self._dispatch_pull_request_opened(repo, event, signature)
 
@@ -369,6 +372,46 @@ class DaniService:
         if self._completed_followup_count(repo.full_name, event.number) >= self.config.max_issue_followups:
             return {"status": "ignored", "reason": "max_followups_reached"}
         return self._queue_issue_followup(repo, event)
+
+    def _dispatch_merge_conflict_resolution_request(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
+        if event.pr_state == "closed":
+            return {"status": "ignored", "reason": "pr_not_open"}
+        if self.storage.is_terminal_pr(repo.full_name, event.number):
+            return {"status": "ignored", "reason": "pr_terminal"}
+        if self._is_dani_self_authored(event):
+            return {"status": "ignored", "reason": "self_authored_comment"}
+        if not self._is_authorized_approver(repo, event):
+            self._react_unauthorized_approve(repo, event)
+            return {"status": "ignored", "reason": "approver_not_authorized"}
+        event_key = self._manual_merge_conflict_event_key(event)
+        if not self.storage.record_processed_event(event_key):
+            return {"status": "ignored", "reason": "duplicate_merge_conflict_request"}
+        if self._has_active_merge_conflict_resolution_job(repo.full_name, event.number):
+            return {"status": "ignored", "reason": "duplicate_merge_conflict_resolution"}
+        pull_request = self.github.get_pull_request(repo.full_name, event.number)
+        issue_number = self._extract_issue_number(pull_request.get("body"))
+        job = self._enqueue_job(
+            repo,
+            stage="merge_conflict_resolution",
+            issue_number=issue_number,
+            pr_number=event.number,
+            metadata={
+                "title": pull_request.get("title") or event.title or f"PR #{event.number}",
+                "body": pull_request.get("body") or "",
+                "head_branch": self._branch_ref(pull_request, "head"),
+                "base_branch": self._branch_ref(pull_request, "base"),
+                "conflict_reason": f"manual GitHub PR comment requested merge conflict resolution: {event.body}",
+            },
+        )
+        return {"status": "queued", "job_id": job.id, "stage": job.stage}
+
+    def _has_active_merge_conflict_resolution_job(self, repo_full_name: str, pr_number: int) -> bool:
+        for job in self.storage.find_jobs(
+            repo_full_name=repo_full_name, stage="merge_conflict_resolution", pr_number=pr_number
+        ):
+            if job.status in {"queued", "launched", "running", "retrying", "recovering"}:
+                return True
+        return False
 
     def _dispatch_pull_request_opened(
         self, repo: RepoConfig, event: NormalizedEvent, signature: dict[str, str] | None
@@ -832,27 +875,30 @@ class DaniService:
         except Exception:
             self._finalize_session(session, status="failed", termination_reason="failed")
             raise
-        if session.omx_session_id is None:
-            post_wait_session_id = runner.get_session_id(session.runtime_handle)
-            if post_wait_session_id:
-                session.omx_session_id = post_wait_session_id
-                self.storage.update_session(
-                    session.id,
-                    omx_session_id=post_wait_session_id,
-                    native_session_runtime=session.native_session_runtime or runtime,
-                    effective_runtime=session.effective_runtime or runtime,
-                )
-        self._finalize_session(session, status="completed", termination_reason="completed")
-        self._update_job_runtime_metadata(
-            job,
-            preferred_runtime=preferred_runtime,
-            effective_runtime=runtime,
-            fallback_reason=fallback_reason,
-            bridge_context=bridge_context,
-            usage_limit_error=usage_limit_error,
-            session=session,
-        )
-        return session
+        else:
+            if session.omx_session_id is None:
+                post_wait_session_id = runner.get_session_id(session.runtime_handle)
+                if post_wait_session_id:
+                    session.omx_session_id = post_wait_session_id
+                    self.storage.update_session(
+                        session.id,
+                        omx_session_id=post_wait_session_id,
+                        native_session_runtime=session.native_session_runtime or runtime,
+                        effective_runtime=session.effective_runtime or runtime,
+                    )
+            self._finalize_session(session, status="completed", termination_reason="completed")
+            self._update_job_runtime_metadata(
+                job,
+                preferred_runtime=preferred_runtime,
+                effective_runtime=runtime,
+                fallback_reason=fallback_reason,
+                bridge_context=bridge_context,
+                usage_limit_error=usage_limit_error,
+                session=session,
+            )
+            return session
+        finally:
+            runner.close_session(session.runtime_handle)
 
     def _annotate_session_record(
         self,
@@ -1868,6 +1914,27 @@ class DaniService:
 
     def _is_approve_comment(self, body: str | None) -> bool:
         return bool(body and "/approve" in body.lower())
+
+    def _is_merge_conflict_resolution_request(self, body: str | None) -> bool:
+        if not body:
+            return False
+        normalized = re.sub(r"\s+", " ", body.strip().casefold())
+        return normalized in {
+            "/resolve-conflict",
+            "/resolve merge conflict",
+            "/solve merge conflict",
+            "solve merge conflict",
+        }
+
+    def _manual_merge_conflict_event_key(self, event: NormalizedEvent) -> str:
+        comment = event.payload.get("comment") if isinstance(event.payload, dict) else None
+        comment_id = comment.get("id") if isinstance(comment, dict) else None
+        if comment_id is not None:
+            return f"manual_merge_conflict;repo={event.repo_full_name};pr={event.number};comment={comment_id}"
+        if event.delivery_id:
+            return f"manual_merge_conflict;delivery={event.delivery_id}"
+        body = re.sub(r"\s+", " ", (event.body or "").strip().casefold())
+        return f"manual_merge_conflict;repo={event.repo_full_name};pr={event.number};body={body}"
 
     def _extract_issue_number(self, body: str | None) -> int | None:
         if not body:

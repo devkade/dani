@@ -15,16 +15,6 @@ RUNTIME_ALIASES: dict[str, str] = {
     "opencode": "omo",
 }
 
-RUNTIME_ALIASES: dict[str, str] = {
-    "omx": "omx",
-    "oh-my-codex": "omx",
-    "codex": "omx",
-    "omo": "omo",
-    "oh-my-openagents": "omo",
-    "oh-my-openagent": "omo",
-    "opencode": "omo",
-}
-
 
 class ManagedProcess(Protocol):
     def poll(self) -> object: ...

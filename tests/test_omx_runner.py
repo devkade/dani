@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import signal
+import subprocess
 import time
 from pathlib import Path
 
@@ -79,6 +81,125 @@ def test_close_session_terminates_active_process(tmp_path: Path) -> None:
 
     runner.close_session("runtime-123")
 
+    assert stdout_file.closed
+    assert stderr_file.closed
+    assert runner._processes == {}
+
+
+def test_close_session_signals_process_group_when_available(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = OmxRunner(run_dir=tmp_path / "runs")
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    stdout_file = stdout_path.open("w", encoding="utf-8")
+    stderr_file = stderr_path.open("w", encoding="utf-8")
+    sent_signals: list[tuple[int, int]] = []
+
+    class Process:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            raise AssertionError("close_session should signal the process group")
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            raise AssertionError("process kill should not be needed")
+
+    monkeypatch.setattr("dani.omx_runner.os.getpgid", lambda pid: 4321)
+    monkeypatch.setattr("dani.omx_runner.os.killpg", lambda pgid, sig: sent_signals.append((pgid, sig)))
+    runner._processes["runtime-123"] = (Process(), stdout_file, stderr_file)
+    runner._process_groups["runtime-123"] = 4321
+
+    runner.close_session("runtime-123")
+
+    assert sent_signals == [(4321, signal.SIGTERM)]
+    assert stdout_file.closed
+    assert stderr_file.closed
+    assert runner._processes == {}
+    assert runner._process_groups == {}
+
+
+def test_close_session_signals_remembered_group_after_parent_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = OmxRunner(run_dir=tmp_path / "runs")
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    stdout_file = stdout_path.open("w", encoding="utf-8")
+    stderr_file = stderr_path.open("w", encoding="utf-8")
+    sent_signals: list[tuple[int, int]] = []
+
+    class Process:
+        pid = 1234
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            raise AssertionError("parent process already exited")
+
+        def wait(self, timeout=None):
+            raise AssertionError("close_session should not wait for an exited parent")
+
+        def kill(self):
+            raise AssertionError("process kill should not be needed")
+
+    monkeypatch.setattr("dani.omx_runner.os.killpg", lambda pgid, sig: sent_signals.append((pgid, sig)))
+    runner._processes["runtime-123"] = (Process(), stdout_file, stderr_file)
+    runner._process_groups["runtime-123"] = 4321
+
+    runner.close_session("runtime-123")
+
+    assert sent_signals == [(4321, signal.SIGTERM)]
+    assert stdout_file.closed
+    assert stderr_file.closed
+    assert runner._processes == {}
+    assert runner._process_groups == {}
+
+
+def test_wait_closes_process_on_timeout(tmp_path: Path) -> None:
+    runner = OmxRunner(run_dir=tmp_path / "runs")
+    stdout_path = tmp_path / "stdout.log"
+    stderr_path = tmp_path / "stderr.log"
+    stdout_path.write_text("", encoding="utf-8")
+    stderr_path.write_text("", encoding="utf-8")
+    stdout_file = stdout_path.open("w", encoding="utf-8")
+    stderr_file = stderr_path.open("w", encoding="utf-8")
+
+    class TimeoutProcess:
+        terminated = False
+        killed = False
+
+        def wait(self, timeout: float | None = None):
+            if timeout == 0.01:
+                raise subprocess.TimeoutExpired(cmd="omx exec", timeout=0.01)
+            return 0
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+    process = TimeoutProcess()
+    runner._processes["runtime-123"] = (process, stdout_file, stderr_file)
+
+    with pytest.raises(TimeoutError, match="did not exit before timeout"):
+        runner.wait("runtime-123", timeout_seconds=0.01)
+
+    assert process.terminated is True
+    assert process.killed is False
     assert stdout_file.closed
     assert stderr_file.closed
     assert runner._processes == {}
