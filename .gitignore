@@ -194,7 +194,12 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
+
+# Local agent/runtime state
+.hermes/
 .omx/
+.ouroboros/
+.uv-cache/
 .dani/
 
 # PyPI configuration file

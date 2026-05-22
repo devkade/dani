@@ -9,6 +9,7 @@ from dani.git_sync import DevSyncConflictError, DevSyncContext, DevSyncOutcome
 from dani.github import MergeConflictError
 from dani.models import JobRecord, SessionRecord
 from dani.signatures import build_signature, is_opt_out_comment, parse_agent_signature, parse_signature
+from dani.work_line import WorkLineContext
 
 _CAPACITY_MSG = "capacity"
 
@@ -240,7 +241,13 @@ class FakeOmxRunner:
                 fields = {"stage": "implementation", "job": job.id}
                 if issue_number:
                     fields["issue"] = str(issue_number)
-                self.github.add_pull_request(repo_full_name, 101, build_signature(**fields))
+                self.github.add_pull_request(
+                    repo_full_name,
+                    101,
+                    build_signature(**fields),
+                    title=f"Feature/#{issue_number}",
+                    head_branch=str(job.metadata.get("branch_name") or f"feature/#{issue_number}"),
+                )
         elif job.stage == "review_round":
             pr_number = int((signature or {}).get("pr", job.pr_number or 0))
             self.github.add_pr_signature(
@@ -431,3 +438,28 @@ class FakeGitDevSyncer:
 
     def cleanup(self, context: DevSyncContext) -> None:
         self.cleanup_calls.append(context)
+
+
+class FakeWorkLineManager:
+    def __init__(self) -> None:
+        self.prepared: list[dict[str, Any]] = []
+
+    def prepare(self, repo: Any, job: JobRecord) -> WorkLineContext:
+        line_id = str(job.metadata.get("line_id") or f"issue-{job.issue_number or job.id}")
+        branch_name = str(job.metadata.get("branch_name") or f"feature/#{job.issue_number}")
+        worktree_path = Path(repo.local_path) / ".dani-worktrees" / line_id
+        self.prepared.append({
+            "repo_full_name": repo.full_name,
+            "job_id": job.id,
+            "line_id": line_id,
+            "branch_name": branch_name,
+            "worktree_path": str(worktree_path),
+        })
+        return WorkLineContext(
+            line_id=line_id,
+            issue_id=str(job.issue_number or ""),
+            pr_id=str(job.pr_number or ""),
+            branch_name=branch_name,
+            worktree_path=worktree_path,
+            repo_path=Path(repo.local_path),
+        )

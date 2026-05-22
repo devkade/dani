@@ -39,12 +39,20 @@ class OmxRunner:
         stdout_path = session_dir / "stdout.log"
         stderr_path = session_dir / "stderr.log"
         prompt_path.write_text(prompt, encoding="utf-8")
-        script_path.write_text(self._build_script(repo_path=repo_path, prompt_path=prompt_path), encoding="utf-8")
+        script_path.write_text(
+            self._build_script(
+                repo_path=repo_path,
+                prompt_path=prompt_path,
+                branch_name=self._branch_name_for_job(job),
+            ),
+            encoding="utf-8",
+        )
         script_path.chmod(0o755)
         stdout_file = stdout_path.open("w", encoding="utf-8")
         stderr_file = stderr_path.open("w", encoding="utf-8")
         process = subprocess.Popen(  # noqa: S603
             [str(script_path)],
+            cwd=str(repo_path),
             stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -83,7 +91,12 @@ class OmxRunner:
         stderr_path = session_dir / "stderr.log"
         prompt_path.write_text(prompt, encoding="utf-8")
         script_path.write_text(
-            self._build_resume_script(repo_path=repo_path, prompt_path=prompt_path, omx_session_id=omx_session_id),
+            self._build_resume_script(
+                repo_path=repo_path,
+                prompt_path=prompt_path,
+                omx_session_id=omx_session_id,
+                branch_name=self._branch_name_for_job(job),
+            ),
             encoding="utf-8",
         )
         script_path.chmod(0o755)
@@ -91,6 +104,7 @@ class OmxRunner:
         stderr_file = stderr_path.open("w", encoding="utf-8")
         process = subprocess.Popen(  # noqa: S603
             [str(script_path)],
+            cwd=str(repo_path),
             stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -115,25 +129,57 @@ class OmxRunner:
             stderr_path=str(stderr_path),
         )
 
-    def _build_script(self, *, repo_path: Path, prompt_path: Path) -> str:
+    def _build_script(self, *, repo_path: Path, prompt_path: Path, branch_name: str | None = None) -> str:
         quoted_repo = shlex.quote(str(repo_path))
         quoted_prompt = shlex.quote(str(prompt_path))
+        branch_guard = self._build_branch_guard(branch_name)
         return (
             "#!/bin/sh\n"
             "set -eu\n"
             f"cd {quoted_repo}\n"
+            f"{branch_guard}"
             f'exec omx exec --dangerously-bypass-approvals-and-sandbox "$(cat {quoted_prompt})"\n'
         )
 
-    def _build_resume_script(self, *, repo_path: Path, prompt_path: Path, omx_session_id: str) -> str:
+    def _build_resume_script(
+        self,
+        *,
+        repo_path: Path,
+        prompt_path: Path,
+        omx_session_id: str,
+        branch_name: str | None = None,
+    ) -> str:
         quoted_repo = shlex.quote(str(repo_path))
         quoted_prompt = shlex.quote(str(prompt_path))
         quoted_session_id = shlex.quote(omx_session_id)
+        branch_guard = self._build_branch_guard(branch_name)
         return (
             "#!/bin/sh\n"
             "set -eu\n"
             f"cd {quoted_repo}\n"
+            f"{branch_guard}"
             f'exec omx exec resume {quoted_session_id} --dangerously-bypass-approvals-and-sandbox "$(cat {quoted_prompt})"\n'
+        )
+
+    def _branch_name_for_job(self, job: JobRecord) -> str | None:
+        branch_name = job.metadata.get("branch_name")
+        return branch_name if isinstance(branch_name, str) and branch_name else None
+
+    def _build_branch_guard(self, branch_name: str | None) -> str:
+        if not branch_name:
+            return ""
+        quoted_branch = shlex.quote(branch_name)
+        return (
+            f"expected_branch={quoted_branch}\n"
+            'current_branch="$(git branch --show-current)"\n'
+            'if [ "$current_branch" != "$expected_branch" ]; then\n'
+            '  git checkout --quiet "$expected_branch"\n'
+            '  current_branch="$(git branch --show-current)"\n'
+            "fi\n"
+            'if [ "$current_branch" != "$expected_branch" ]; then\n'
+            '  echo "dani branch context mismatch: expected $expected_branch, got $current_branch" >&2\n'
+            "  exit 1\n"
+            "fi\n"
         )
 
     def wait(

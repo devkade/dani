@@ -13,7 +13,7 @@ from dani.models import DaniConfig
 from dani.server import create_app
 from dani.service import DaniService
 from dani.storage import JsonStorage
-from tests.helpers import FakeGitHubCLI, FakeOmxRunner
+from tests.helpers import FakeGitHubCLI, FakeOmxRunner, FakeWorkLineManager
 
 TEST_SECRET = "unit-test-secret"
 
@@ -28,7 +28,11 @@ def test_github_webhook_endpoint_accepts_valid_signature(tmp_path: Path) -> None
     github = FakeGitHubCLI()
     omx_runner = FakeOmxRunner(github)
     service = DaniService(
-        config, storage=JsonStorage(config), github=cast(GitHubCLI, github), omx_runner=cast(AgentRunner, omx_runner)
+        config,
+        storage=JsonStorage(config),
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     client = TestClient(create_app(service))
@@ -53,6 +57,43 @@ def test_github_webhook_endpoint_accepts_valid_signature(tmp_path: Path) -> None
     assert response.json()["status"] == "queued"
 
 
+def test_github_webhook_alias_accepts_approve_comments(tmp_path: Path) -> None:
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    github = FakeGitHubCLI()
+    omx_runner = FakeOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=JsonStorage(config),
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        work_line_manager=FakeWorkLineManager(),
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+    client = TestClient(create_app(service))
+    payload = {
+        "action": "created",
+        "repository": {"full_name": "acme/demo"},
+        "issue": {"number": 3, "title": "Need it", "body": "Please", "state": "open"},
+        "comment": {"id": 30, "body": "/approve", "author_association": "OWNER"},
+        "sender": {"login": "acme"},
+    }
+    body = json.dumps(payload).encode("utf-8")
+
+    response = client.post(
+        "/github/webhook",
+        content=body,
+        headers={
+            "x-github-event": "issue_comment",
+            "x-hub-signature-256": _signature(TEST_SECRET, body),
+        },
+    )
+
+    service.wait_for_idle()
+
+    assert response.status_code == 200
+    assert response.json()["stage"] == "implementation"
+
+
 def test_github_webhook_endpoint_queues_dev_sync_on_main_push(tmp_path: Path) -> None:
     class FakeSyncer:
         def sync(self, repo: object, job: object) -> DevSyncOutcome:
@@ -67,6 +108,7 @@ def test_github_webhook_endpoint_queues_dev_sync_on_main_push(tmp_path: Path) ->
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, omx_runner),
         dev_syncer=FakeSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     client = TestClient(create_app(service))
@@ -99,7 +141,11 @@ def test_github_webhook_endpoint_dedupes_duplicate_external_pr_delivery(tmp_path
     github = FakeGitHubCLI()
     omx_runner = FakeOmxRunner(github)
     service = DaniService(
-        config, storage=JsonStorage(config), github=cast(GitHubCLI, github), omx_runner=cast(AgentRunner, omx_runner)
+        config,
+        storage=JsonStorage(config),
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     client = TestClient(create_app(service))
