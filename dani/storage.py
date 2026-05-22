@@ -5,7 +5,15 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from dani.models import DaniConfig, JobRecord, RepoConfig, SessionRecord, effective_session_runtime, utc_now
+from dani.models import (
+    DaniConfig,
+    JobRecord,
+    RepoConfig,
+    SessionRecord,
+    WorkLineRecord,
+    effective_session_runtime,
+    utc_now,
+)
 
 
 class JsonStorage:
@@ -22,6 +30,7 @@ class JsonStorage:
         self._ensure_json_file(self.config.sessions_path, {"sessions": []})
         self._ensure_json_file(self.config.processed_events_path, {"keys": []})
         self._ensure_json_file(self.config.terminal_targets_path, {"prs": [], "issues": []})
+        self._ensure_json_file(self.config.work_lines_path, {"work_lines": []})
         if not self.config.events_path.exists():
             self.config.events_path.write_text("", encoding="utf-8")
 
@@ -139,6 +148,64 @@ class JsonStorage:
             payload = self._read_json(self.config.sessions_path)
             return [SessionRecord(**item) for item in payload["sessions"]]
 
+    def upsert_work_line(self, work_line: WorkLineRecord) -> WorkLineRecord:
+        with self._lock:
+            payload = self._read_json(self.config.work_lines_path)
+            lines = payload["work_lines"]
+            for item in lines:
+                if item["repo_full_name"] == work_line.repo_full_name and item["line_id"] == work_line.line_id:
+                    created_at = item.get("created_at", work_line.created_at)
+                    item.update(work_line.to_dict())
+                    item["created_at"] = created_at
+                    item["updated_at"] = utc_now()
+                    self._write_json(self.config.work_lines_path, payload)
+                    return WorkLineRecord(**item)
+            lines.append(work_line.to_dict())
+            payload["work_lines"] = sorted(lines, key=lambda item: (item["repo_full_name"], item["line_id"]))
+            self._write_json(self.config.work_lines_path, payload)
+            return work_line
+
+    def update_work_line(
+        self,
+        repo_full_name: str,
+        line_id: str,
+        *,
+        agent_run_id: str | None = None,
+        **changes: Any,
+    ) -> WorkLineRecord:
+        with self._lock:
+            payload = self._read_json(self.config.work_lines_path)
+            for item in payload["work_lines"]:
+                if item["repo_full_name"] != repo_full_name or item["line_id"] != line_id:
+                    continue
+                item.update(changes)
+                if agent_run_id:
+                    agent_run_ids = [str(value) for value in item.get("agent_run_ids", [])]
+                    if agent_run_id not in agent_run_ids:
+                        agent_run_ids.append(agent_run_id)
+                    item["agent_run_ids"] = agent_run_ids
+                item["updated_at"] = utc_now()
+                self._write_json(self.config.work_lines_path, payload)
+                return WorkLineRecord(**item)
+        msg = f"Unknown work line: {repo_full_name}#{line_id}"
+        raise KeyError(msg)
+
+    def get_work_line(self, repo_full_name: str, line_id: str) -> WorkLineRecord | None:
+        with self._lock:
+            payload = self._read_json(self.config.work_lines_path)
+            for item in payload["work_lines"]:
+                if item["repo_full_name"] == repo_full_name and item["line_id"] == line_id:
+                    return WorkLineRecord(**item)
+        return None
+
+    def list_work_lines(self, *, repo_full_name: str | None = None) -> list[WorkLineRecord]:
+        with self._lock:
+            payload = self._read_json(self.config.work_lines_path)
+            lines = [WorkLineRecord(**item) for item in payload["work_lines"]]
+        if repo_full_name is None:
+            return lines
+        return [line for line in lines if line.repo_full_name == repo_full_name]
+
     def find_latest_session(
         self,
         *,
@@ -228,6 +295,7 @@ class JsonStorage:
                 "registry": self._read_json(self.config.registry_path),
                 "jobs": self._read_json(self.config.jobs_path),
                 "sessions": self._read_json(self.config.sessions_path),
+                "work_lines": self._read_json(self.config.work_lines_path),
                 "processed_events": self._read_json(self.config.processed_events_path),
                 "terminal_targets": self._read_json(self.config.terminal_targets_path),
                 "events_path": str(self.config.events_path),

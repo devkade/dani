@@ -1,3 +1,5 @@
+import os
+import subprocess
 import threading
 from pathlib import Path
 from typing import cast
@@ -14,9 +16,52 @@ from dani.service import DaniService
 from dani.session_bridge import BridgeContext, OmoSessionBridge
 from dani.signatures import build_signature
 from dani.storage import JsonStorage
-from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner, FakeRuntimeRunner
+from dani.work_line import GitWorkLineManager
+from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner, FakeRuntimeRunner, FakeWorkLineManager
 
 TEST_SECRET = "unit-test-secret"
+
+
+def _git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    env = os.environ | {
+        "GIT_AUTHOR_NAME": "Tester",
+        "GIT_AUTHOR_EMAIL": "tester@example.com",
+        "GIT_COMMITTER_NAME": "Tester",
+        "GIT_COMMITTER_EMAIL": "tester@example.com",
+    }
+    return subprocess.run(  # noqa: S603
+        ["git", "-C", str(path), *args],  # noqa: S607
+        check=check,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def _init_git_repo(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin.git"
+    repo_path = tmp_path / "repo"
+    subprocess.run(  # noqa: S603
+        ["git", "init", "--bare", str(origin)],  # noqa: S607
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(  # noqa: S603
+        ["git", "clone", str(origin), str(repo_path)],  # noqa: S607
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo_path / "app.txt").write_text("base\n", encoding="utf-8")
+    _git(repo_path, "add", "app.txt")
+    _git(repo_path, "commit", "-m", "initial")
+    _git(repo_path, "branch", "-M", "main")
+    _git(repo_path, "push", "-u", "origin", "main")
+    _git(repo_path, "checkout", "-b", "dev")
+    _git(repo_path, "push", "-u", "origin", "dev")
+    _git(repo_path, "checkout", "main")
+    return repo_path
 
 
 def add_exact_review_signature(github: FakeGitHubCLI, job: JobRecord) -> None:
@@ -55,6 +100,7 @@ def make_service(
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, omx_runner),
         dev_syncer=dev_syncer or FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, omx_runner
@@ -89,6 +135,7 @@ def make_omo_preferred_service(
         dev_syncer=dev_syncer or FakeGitDevSyncer(),
         runtime_runners={RUNTIME_OMX: cast(OmxRunner, omx_runner)},
         session_bridge=cast(OmoSessionBridge, bridge),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, omo_runner, omx_runner
@@ -997,6 +1044,538 @@ def test_approve_comment_queues_implementation(tmp_path: Path) -> None:
     assert service.storage.list_jobs()[0].status == "completed"
 
 
+def test_new_implementation_creates_isolated_work_line_before_launch(tmp_path: Path) -> None:
+    work_line_manager = FakeWorkLineManager()
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=work_line_manager,
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-11"
+    assert result["stage"] == "implementation"
+    assert work_line_manager.prepared == [
+        {
+            "repo_full_name": "acme/demo",
+            "job_id": job.id,
+            "line_id": "issue-11",
+            "branch_name": "feature/#11",
+            "worktree_path": str(expected_worktree),
+        }
+    ]
+    assert omx_runner.launches[0]["repo_path"] == str(expected_worktree)
+    assert job.metadata["line_id"] == "issue-11"
+    assert job.metadata["issue_id"] == "11"
+    assert job.metadata["branch_name"] == "feature/#11"
+    assert job.metadata["worktree_path"] == str(expected_worktree)
+    assert job.metadata["repo_path"] == str(tmp_path)
+    assert job.metadata["cleanup_state"] == "preserved"
+    assert job.metadata["retryable"] is True
+    assert job.metadata["agent_run_ids"] == [job.session_id]
+    work_line = service.storage.get_work_line("acme/demo", "issue-11")
+    assert work_line is not None
+    assert work_line.status == "agent_completed"
+    assert work_line.issue_id == "11"
+    assert work_line.branch_name == "feature/#11"
+    assert work_line.worktree_path == str(expected_worktree)
+    assert work_line.agent_run_ids == [job.session_id]
+    assert work_line.cleanup_state == "preserved"
+    assert work_line.retryable is True
+
+
+def test_sibling_implementation_work_line_states_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+
+    for issue_number in (11, 12):
+        service.handle_event(
+            NormalizedEvent(
+                kind="issue_comment",
+                repo_full_name="acme/demo",
+                action="created",
+                number=issue_number,
+                actor_login="acme",
+                payload={"issue": {"body": f"context {issue_number}"}, "comment": {"id": issue_number}},
+                body="/approve",
+                title=f"Need automation {issue_number}",
+            )
+        )
+    service.wait_for_idle()
+
+    first_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    second_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[0]
+    first = service.storage.get_work_line("acme/demo", "issue-11")
+    second = service.storage.get_work_line("acme/demo", "issue-12")
+
+    assert first is not None
+    assert second is not None
+    assert first.issue_id == "11"
+    assert first.branch_name == "feature/#11"
+    assert first.worktree_path.endswith(".dani-worktrees/issue-11")
+    assert first.agent_run_ids == [first_job.session_id]
+    assert second.issue_id == "12"
+    assert second.branch_name == "feature/#12"
+    assert second.worktree_path.endswith(".dani-worktrees/issue-12")
+    assert second.agent_run_ids == [second_job.session_id]
+    assert first.agent_run_ids != second.agent_run_ids
+
+
+def test_state_snapshot_reports_each_work_line_with_own_worktree_and_result(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+
+    for issue_number in (31, 32):
+        service.handle_event(
+            NormalizedEvent(
+                kind="issue_comment",
+                repo_full_name="acme/demo",
+                action="created",
+                number=issue_number,
+                actor_login="acme",
+                payload={"issue": {"body": f"context {issue_number}"}, "comment": {"id": issue_number}},
+                body="/approve",
+                title=f"Need automation {issue_number}",
+            )
+        )
+    service.wait_for_idle()
+
+    snapshot = service.state_snapshot()
+    jobs = {
+        str(job["metadata"]["line_id"]): job for job in snapshot["jobs"]["jobs"] if job["stage"] == "implementation"
+    }
+    sessions = {session["job_id"]: session for session in snapshot["sessions"]["sessions"]}
+    work_lines = {line["line_id"]: line for line in snapshot["work_lines"]["work_lines"]}
+
+    assert set(jobs) == {"issue-31", "issue-32"}
+    assert set(work_lines) == {"issue-31", "issue-32"}
+    for line_id, job in jobs.items():
+        work_line = work_lines[line_id]
+        session = sessions[job["id"]]
+        expected_worktree = str(tmp_path / ".dani-worktrees" / line_id)
+
+        assert job["status"] == "completed"
+        assert job["metadata"]["worktree_path"] == expected_worktree
+        assert job["metadata"]["agent_run_ids"] == [job["session_id"]]
+        assert session["status"] == "completed"
+        assert session["worktree_path"] == expected_worktree
+        assert work_line["status"] == "agent_completed"
+        assert work_line["worktree_path"] == expected_worktree
+        assert work_line["agent_run_ids"] == [job["session_id"]]
+        assert work_line["cleanup_state"] == "preserved"
+        assert work_line["retryable"] is True
+
+    assert jobs["issue-31"]["session_id"] != jobs["issue-32"]["session_id"]
+    assert work_lines["issue-31"]["worktree_path"] != work_lines["issue-32"]["worktree_path"]
+
+
+def test_final_verdict_updates_only_own_work_line_merge_state(tmp_path: Path) -> None:
+    service, github, _ = make_service(tmp_path)
+
+    for issue_number in (21, 22):
+        service.handle_event(
+            NormalizedEvent(
+                kind="issue_comment",
+                repo_full_name="acme/demo",
+                action="created",
+                number=issue_number,
+                actor_login="acme",
+                payload={"issue": {"body": f"context {issue_number}"}, "comment": {"id": issue_number}},
+                body="/approve",
+                title=f"Need automation {issue_number}",
+            )
+        )
+    service.wait_for_idle()
+    first_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=21)[0]
+    second_before = service.storage.get_work_line("acme/demo", "issue-22")
+    assert second_before is not None
+
+    final_verdict_job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=21,
+            pr_number=101,
+            metadata={**first_job.metadata, "title": "Feature/#21", "body": ""},
+        )
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="final_verdict", job=final_verdict_job.id, pr=101, verdict="APPROVE"),
+        )
+    )
+
+    first_after = service.storage.get_work_line("acme/demo", "issue-21")
+    second_after = service.storage.get_work_line("acme/demo", "issue-22")
+    assert result == {"status": "merged", "pr_number": 101}
+    assert github.merged == [("acme/demo", 101)]
+    assert first_after is not None
+    assert first_after.status == "merged"
+    assert first_after.auto_merge_state == "merged"
+    assert first_after.retryable is False
+    assert second_after is not None
+    assert second_after.auto_merge_state == second_before.auto_merge_state
+    assert second_after.retryable == second_before.retryable
+
+
+def test_review_fix_reuses_original_isolated_work_line(tmp_path: Path) -> None:
+    work_line_manager = FakeWorkLineManager()
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=work_line_manager,
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+
+    implementation_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
+        )
+    )
+    service.wait_for_idle()
+    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
+
+    review_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=(
+                "Changes requested:\n"
+                "- Add regression coverage for the edge case.\n\n"
+                f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
+            ),
+        )
+    )
+    service.wait_for_idle()
+
+    implementation_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)
+    review_fix_job = implementation_jobs[-1]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-11"
+    assert implementation_result["stage"] == "review_round"
+    assert review_result["stage"] == "implementation"
+    assert work_line_manager.prepared == [
+        {
+            "repo_full_name": "acme/demo",
+            "job_id": initial_job.id,
+            "line_id": "issue-11",
+            "branch_name": "feature/#11",
+            "worktree_path": str(expected_worktree),
+        },
+        {
+            "repo_full_name": "acme/demo",
+            "job_id": review_fix_job.id,
+            "line_id": "issue-11",
+            "branch_name": "feature/#11",
+            "worktree_path": str(expected_worktree),
+        },
+    ]
+    assert omx_runner.launches[-1]["job"].id == review_fix_job.id
+    assert omx_runner.launches[-1]["repo_path"] == str(expected_worktree)
+    assert "PR review/comment history to address:" in omx_runner.launches[-1]["prompt"]
+    assert "Add regression coverage for the edge case." in omx_runner.launches[-1]["prompt"]
+    assert review_fix_job.metadata["line_id"] == "issue-11"
+    assert review_fix_job.metadata["worktree_path"] == str(expected_worktree)
+    assert "Changes requested:" in review_fix_job.metadata["review_comment_body"]
+    assert review_fix_job.metadata["agent_run_ids"] == [
+        initial_job.session_id,
+        review_job.session_id,
+        review_fix_job.session_id,
+    ]
+    work_line = service.storage.get_work_line("acme/demo", "issue-11")
+    assert work_line is not None
+    assert work_line.agent_run_ids == [initial_job.session_id, review_job.session_id, review_fix_job.session_id]
+
+
+def test_review_fix_loop_repeats_in_same_work_line_until_final_approval(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
+        )
+    )
+    service.wait_for_idle()
+    assert result["stage"] == "review_round"
+
+    for round_number in (1, 2, 3):
+        review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[-1]
+        result = service.handle_event(
+            make_pr_comment_event(
+                pr_number=101,
+                body=(
+                    f"Changes requested in review round {round_number}.\n\n"
+                    f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=round_number)}"
+                ),
+            )
+        )
+        service.wait_for_idle()
+        assert result["stage"] == "implementation"
+        assert github.merged == []
+
+        implementation_job = service.storage.find_jobs(
+            repo_full_name="acme/demo", stage="implementation", pr_number=101
+        )[-1]
+        assert implementation_job.metadata["line_id"] == "issue-11"
+        assert implementation_job.metadata["worktree_path"] == str(tmp_path / ".dani-worktrees" / "issue-11")
+        assert f"review round {round_number}" in implementation_job.metadata["review_comment_body"]
+
+        result = service.handle_event(
+            make_pr_comment_event(
+                pr_number=101,
+                body=build_signature(stage="implementation", job=implementation_job.id, pr=101, issue=11),
+            )
+        )
+        service.wait_for_idle()
+        assert result["stage"] == ("final_verdict" if round_number == 3 else "review_round")
+        assert github.merged == []
+
+    verdict_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101)[0]
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="final_verdict", job=verdict_job.id, pr=101, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-11")
+    line_job_ids = [launch["job"].id for launch in omx_runner.launches]
+    assert result == {"status": "merged", "pr_number": 101}
+    assert github.merged == [("acme/demo", 101)]
+    assert [
+        job.review_round for job in service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round")
+    ] == [
+        1,
+        2,
+        3,
+    ]
+    assert len(service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)) == 3
+    assert [launch["repo_path"] for launch in omx_runner.launches] == [
+        str(tmp_path / ".dani-worktrees" / "issue-11")
+    ] * 8
+    assert work_line is not None
+    assert work_line.status == "merged"
+    assert work_line.pr_id == "101"
+    assert work_line.review_state == "round_3_completed"
+    assert work_line.auto_merge_state == "merged"
+    assert work_line.retryable is False
+    line_jobs = [job for job_id in line_job_ids if (job := service.storage.get_job(job_id)) is not None]
+    assert work_line.agent_run_ids == [job.session_id for job in line_jobs]
+
+
+def test_review_fix_agent_commits_to_original_branch(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+
+    class CommittingRunner(FakeOmxRunner):
+        def launch(self, repo_path: Path, job: JobRecord, prompt: str) -> SessionRecord:
+            session = super().launch(repo_path, job, prompt)
+            if job.stage == "review_round" and job.issue_number is not None:
+                add_exact_review_signature(self.github, job)
+            if job.stage == "implementation":
+                current_branch = _git(repo_path, "branch", "--show-current").stdout.strip()
+                with (repo_path / "app.txt").open("a", encoding="utf-8") as app_file:
+                    app_file.write(f"{job.id} on {current_branch}\n")
+                _git(repo_path, "add", "app.txt")
+                _git(repo_path, "commit", "-m", f"{job.stage} {job.id}")
+            return session
+
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    runner = CommittingRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    expected_worktree = tmp_path / ".dani-runs" / "worktrees" / "acme-demo" / "issue-11"
+    initial_head = _git(expected_worktree, "rev-parse", "feature/#11").stdout.strip()
+
+    service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
+        )
+    )
+    service.wait_for_idle()
+    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=(
+                "Please fix the reviewed edge case.\n\n"
+                f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
+            ),
+        )
+    )
+    service.wait_for_idle()
+
+    review_fix_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)[-1]
+    fix_head = _git(expected_worktree, "rev-parse", "feature/#11").stdout.strip()
+    assert result["stage"] == "implementation"
+    assert review_fix_job.metadata["branch_name"] == "feature/#11"
+    assert review_fix_job.metadata["worktree_path"] == str(expected_worktree)
+    assert runner.launches[-1]["repo_path"] == str(expected_worktree)
+    assert _git(expected_worktree, "branch", "--show-current").stdout.strip() == "feature/#11"
+    assert fix_head != initial_head
+    assert _git(expected_worktree, "log", "-1", "--format=%s").stdout.strip() == f"implementation {review_fix_job.id}"
+    assert (expected_worktree / "app.txt").read_text(encoding="utf-8").endswith(f"{review_fix_job.id} on feature/#11\n")
+    assert (repo_path / "app.txt").read_text(encoding="utf-8") == "base\n"
+
+
+def test_implementation_executes_with_preferred_runtime_inside_work_line(tmp_path: Path) -> None:
+    service, _, omo_runner, omx_runner = make_omo_preferred_service(tmp_path)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=12,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need OMO implementation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[0]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-12"
+    assert result["stage"] == "implementation"
+    assert job.status == "completed"
+    assert omo_runner.launches[0]["repo_path"] == str(expected_worktree)
+    assert "$ralph" not in omo_runner.launches[0]["prompt"]
+    assert "ultrawork" in omo_runner.launches[0]["prompt"]
+    assert omx_runner.launches == []
+    assert job.metadata["preferred_runtime"] == RUNTIME_OMO
+    assert job.metadata["effective_runtime"] == RUNTIME_OMO
+    assert job.metadata["native_session_runtime"] == RUNTIME_OMO
+    assert job.metadata["worktree_path"] == str(expected_worktree)
+    assert job.metadata["agent_run_ids"] == [job.session_id]
+
+
+def test_implementation_runtime_fallback_stays_inside_same_work_line(tmp_path: Path) -> None:
+    service, _, omo_runner, omx_runner = make_omo_preferred_service(tmp_path)
+    omo_runner.queue_wait_error(
+        ClaudeUsageLimitError(
+            "Claude usage limit reached",
+            "Claude usage limit reached",
+            "session_window",
+            reset_hint="in 5 hours",
+            suggested_retry_at="2026-04-22T08:00:00+00:00",
+        )
+    )
+
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=13,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need fallback implementation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=13)[0]
+    sessions = service.storage.list_sessions()
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-13"
+    assert job.status == "completed"
+    assert [launch["repo_path"] for launch in omo_runner.launches] == [str(expected_worktree)]
+    assert [launch["repo_path"] for launch in omx_runner.launches] == [str(expected_worktree)]
+    assert "ultrawork" in omo_runner.launches[0]["prompt"]
+    assert "$ralph" in omx_runner.launches[0]["prompt"]
+    assert job.metadata["preferred_runtime"] == RUNTIME_OMO
+    assert job.metadata["effective_runtime"] == RUNTIME_OMX
+    assert job.metadata["fallback_reason"] == "claude_session_window_limit"
+    assert job.metadata["worktree_path"] == str(expected_worktree)
+    assert job.metadata["agent_run_ids"] == [session.id for session in sessions]
+    assert [session.worktree_path for session in sessions] == [str(expected_worktree), str(expected_worktree)]
+    assert [session.status for session in sessions] == ["failed", "completed"]
+
+
 def test_approve_from_repo_owner_login_queues_implementation(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
 
@@ -1248,6 +1827,248 @@ def test_pr_opened_from_implementation_signature_queues_review_round(tmp_path: P
     assert result["stage"] == "review_round"
     assert review_jobs[0].review_round == 1
     assert omx_runner.launches[-1]["job"].stage == "review_round"
+
+
+def test_implementation_pr_creation_keeps_agent_owned_branch_and_worktree(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=12,
+            actor_login="acme",
+            payload={"issue": {"body": "Ship it"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Ship it",
+        )
+    )
+    service.wait_for_idle()
+
+    implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[
+        0
+    ]
+    implementation_pr = github.list_pull_requests("acme/demo")[0]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-12"
+
+    assert implementation_job.metadata["line_id"] == "issue-12"
+    assert implementation_job.metadata["branch_name"] == "feature/#12"
+    assert implementation_job.metadata["worktree_path"] == str(expected_worktree)
+    assert omx_runner.launches[0]["repo_path"] == str(expected_worktree)
+    assert (
+        "python -m dani.github_helper ensure-pr --repo acme/demo --head feature/#12 --base dev "
+        '--title "Feature/#12" --body-file <pr-body.md>'
+    ) in omx_runner.launches[0]["prompt"]
+    assert implementation_pr["head"]["ref"] == implementation_job.metadata["branch_name"]
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="pull_request_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=int(implementation_pr["number"]),
+            actor_login="agent",
+            payload={"pull_request": {"head": {"sha": "sha-101-opened"}}},
+            body=str(implementation_pr["body"]),
+            title=str(implementation_pr["title"]),
+            base_branch="dev",
+            head_branch=str(implementation_pr["head"]["ref"]),
+            commit_sha="sha-101-opened",
+            is_pull_request=True,
+        )
+    )
+    service.wait_for_idle()
+
+    review_job = service.storage.find_jobs(
+        repo_full_name="acme/demo", stage="review_round", pr_number=int(implementation_pr["number"])
+    )[0]
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert result["stage"] == "review_round"
+    assert review_job.metadata["line_id"] == implementation_job.metadata["line_id"]
+    assert review_job.metadata["branch_name"] == implementation_job.metadata["branch_name"]
+    assert review_job.metadata["worktree_path"] == implementation_job.metadata["worktree_path"]
+    assert omx_runner.launches[-1]["repo_path"] == str(expected_worktree)
+    assert work_line is not None
+    assert work_line.branch_name == implementation_job.metadata["branch_name"]
+    assert work_line.worktree_path == implementation_job.metadata["worktree_path"]
+
+
+def test_agent_managed_pr_review_runs_inside_original_work_line(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=12,
+            actor_login="acme",
+            payload={"issue": {"body": "Ship it"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Ship it",
+        )
+    )
+    service.wait_for_idle()
+    implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[
+        0
+    ]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-12"
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="pull_request_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=99,
+            actor_login="agent",
+            payload={},
+            body=f"Implements #12\n{build_signature(stage='implementation', job=implementation_job.id, issue=12)}",
+            title="Feature/#12",
+            base_branch="dev",
+            head_branch="Feature/#12",
+            is_pull_request=True,
+        )
+    )
+    service.wait_for_idle()
+
+    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=99)[0]
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert result["stage"] == "review_round"
+    assert review_job.metadata["line_id"] == "issue-12"
+    assert review_job.metadata["pr_id"] == "99"
+    assert review_job.metadata["worktree_path"] == str(expected_worktree)
+    assert omx_runner.launches[-1]["repo_path"] == str(expected_worktree)
+    assert omx_runner.launches[-1]["job"].id == review_job.id
+    assert "You are reviewing PR #99 in acme/demo." in omx_runner.launches[-1]["prompt"]
+    assert (
+        "Use the code locally and run $code-review before writing the review comment."
+        in omx_runner.launches[-1]["prompt"]
+    )
+    assert work_line is not None
+    assert work_line.pr_id == "99"
+    assert work_line.review_state == "round_1_completed"
+    assert work_line.agent_run_ids == [implementation_job.session_id, review_job.session_id]
+
+
+def test_agent_managed_pr_review_keeps_originating_branch_and_worktree(tmp_path: Path) -> None:
+    class ExactReviewSignatureOmxRunner(FakeOmxRunner):
+        def launch(self, repo_path: Path, job: JobRecord, prompt: str):
+            session = super().launch(repo_path, job, prompt)
+            if job.stage == "review_round" and job.issue_number is not None:
+                add_exact_review_signature(self.github, job)
+            return session
+
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = ExactReviewSignatureOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(config.run_dir),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=12,
+            actor_login="acme",
+            payload={"issue": {"body": "Ship it"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Ship it",
+        )
+    )
+    service.wait_for_idle()
+
+    implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[
+        0
+    ]
+    implementation_worktree = Path(str(implementation_job.metadata["worktree_path"]))
+    implementation_branch = str(implementation_job.metadata["branch_name"])
+    implementation_pr = github.list_pull_requests("acme/demo")[0]
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="pull_request_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=int(implementation_pr["number"]),
+            actor_login="agent",
+            payload={"pull_request": {"head": {"sha": "sha-101-opened"}}},
+            body=str(implementation_pr["body"]),
+            title=str(implementation_pr["title"]),
+            base_branch="dev",
+            head_branch=implementation_branch,
+            commit_sha="sha-101-opened",
+            is_pull_request=True,
+        )
+    )
+    service.wait_for_idle()
+
+    review_job = service.storage.find_jobs(
+        repo_full_name="acme/demo", stage="review_round", pr_number=int(implementation_pr["number"])
+    )[0]
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert result["stage"] == "review_round"
+    assert implementation_branch == "feature/#12"
+    assert implementation_worktree.is_dir()
+    assert _git(implementation_worktree, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == implementation_branch
+    assert omx_runner.launches[0]["repo_path"] == str(implementation_worktree)
+    assert review_job.metadata["line_id"] == implementation_job.metadata["line_id"] == "issue-12"
+    assert review_job.metadata["branch_name"] == implementation_branch
+    assert review_job.metadata["worktree_path"] == str(implementation_worktree)
+    assert omx_runner.launches[-1]["repo_path"] == str(implementation_worktree)
+    assert work_line is not None
+    assert work_line.branch_name == implementation_branch
+    assert work_line.worktree_path == str(implementation_worktree)
+    assert work_line.agent_run_ids == [implementation_job.session_id, review_job.session_id]
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="pull_request_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=int(implementation_pr["number"]),
+            actor_login="agent",
+            payload={},
+            body=build_signature(
+                stage="review_round",
+                job=review_job.id,
+                pr=int(implementation_pr["number"]),
+                round=1,
+                issue=12,
+            ),
+            title=str(implementation_pr["title"]),
+            is_pull_request=True,
+        )
+    )
+    service.wait_for_idle()
+
+    fix_job = service.storage.find_jobs(
+        repo_full_name="acme/demo", stage="implementation", pr_number=int(implementation_pr["number"])
+    )[-1]
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert result["stage"] == "implementation"
+    assert fix_job.id != implementation_job.id
+    assert fix_job.metadata["line_id"] == implementation_job.metadata["line_id"] == "issue-12"
+    assert fix_job.metadata["branch_name"] == implementation_branch
+    assert fix_job.metadata["worktree_path"] == str(implementation_worktree)
+    assert _git(implementation_worktree, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == implementation_branch
+    assert omx_runner.launches[-1]["job"].id == fix_job.id
+    assert omx_runner.launches[-1]["repo_path"] == str(implementation_worktree)
+    assert (
+        f"- Use the existing isolated worktree and branch: {implementation_branch}" in omx_runner.launches[-1]["prompt"]
+    )
+    assert work_line is not None
+    assert work_line.branch_name == implementation_branch
+    assert work_line.worktree_path == str(implementation_worktree)
+    assert work_line.agent_run_ids == [implementation_job.session_id, review_job.session_id, fix_job.session_id]
 
 
 def test_external_pr_opened_queues_review_round(tmp_path: Path) -> None:
@@ -1709,6 +2530,7 @@ def test_review_chain_reaches_verdict_and_merges_on_approve(tmp_path: Path) -> N
 
     verdict_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77)
     assert verdict_jobs
+    verdict_job = verdict_jobs[0]
     assert omx_runner.launches[-1]["job"].stage == "final_verdict"
     assert [
         job.review_round
@@ -1723,12 +2545,13 @@ def test_review_chain_reaches_verdict_and_merges_on_approve(tmp_path: Path) -> N
         number=77,
         actor_login="agent",
         payload={},
-        body=build_signature(stage="final_verdict", job="verdict-1", pr=77, verdict="APPROVE"),
+        body=build_signature(stage="final_verdict", job=verdict_job.id, pr=77, verdict="APPROVE"),
         title="Feature/#5",
         is_pull_request=True,
     )
-    service.handle_event(verdict_event)
+    result = service.handle_event(verdict_event)
 
+    assert result == {"status": "merged", "pr_number": 77}
     assert github.merged == [("acme/demo", 77)]
 
 
@@ -2086,6 +2909,374 @@ def test_final_verdict_transient_failure_allows_redelivery(tmp_path: Path) -> No
     result = service.handle_event(event)
     assert result["status"] == "merged"
     assert ("acme/demo", 77) in github.merged
+
+
+def test_final_verdict_cleans_worktree_and_local_branch_after_successful_merge(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=11,
+            pr_number=101,
+            metadata={"line_id": "issue-11"},
+        )
+    )
+    service._ensure_work_line(repo, job)
+    github.add_pull_request(
+        "acme/demo",
+        101,
+        "Implements #11",
+        title="Feature/#11",
+        head_branch="feature/#11",
+        base_branch="dev",
+    )
+    worktree_path = tmp_path / ".dani-runs" / "worktrees" / "acme-demo" / "issue-11"
+    merge_seen: list[tuple[str, str]] = []
+    original_merge = github.merge_pull_request
+
+    def assert_merge_uses_agent_owned_line(repo_full_name: str, pr_number: int) -> None:
+        pull_request = github.get_pull_request(repo_full_name, pr_number)
+        assert pull_request["head"]["ref"] == "feature/#11"
+        assert worktree_path.is_dir()
+        assert _git(worktree_path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feature/#11"
+        assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#11").returncode == 0
+        merge_seen.append((repo_full_name, pull_request["head"]["ref"]))
+        original_merge(repo_full_name, pr_number)
+
+    github.merge_pull_request = assert_merge_uses_agent_owned_line  # type: ignore[assignment]
+
+    assert worktree_path.is_dir()
+    assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#11").returncode == 0
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="final_verdict", job=job.id, pr=101, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-11")
+    assert result == {"status": "merged", "pr_number": 101}
+    assert merge_seen == [("acme/demo", "feature/#11")]
+    assert github.merged == [("acme/demo", 101)]
+    assert not worktree_path.exists()
+    assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#11", check=False).returncode != 0
+    assert work_line is not None
+    assert work_line.status == "merged"
+    assert work_line.auto_merge_state == "merged"
+    assert work_line.cleanup_state == "cleaned"
+    assert work_line.cleanup_error == ""
+    assert work_line.retryable is False
+
+
+def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    submitted_jobs: list[JobRecord] = []
+
+    class CapturingQueue:
+        def submit(self, submitted_job: JobRecord) -> None:
+            submitted_jobs.append(submitted_job)
+
+        def join_all(self) -> None:
+            return None
+
+    service.queue_manager = CapturingQueue()
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=12,
+            pr_number=102,
+            metadata={"line_id": "issue-12"},
+        )
+    )
+    service._ensure_work_line(repo, job)
+    ownership_metadata = {
+        "line_id": job.metadata["line_id"],
+        "branch_name": job.metadata["branch_name"],
+        "worktree_path": job.metadata["worktree_path"],
+        "repo_path": job.metadata["repo_path"],
+    }
+    github.add_pull_request(
+        "acme/demo",
+        102,
+        "Implements #12",
+        title="Feature/#12",
+        head_branch="feature/#12",
+        base_branch="dev",
+    )
+    github.merge_conflicts.add(("acme/demo", 102))
+    worktree_path = tmp_path / ".dani-runs" / "worktrees" / "acme-demo" / "issue-12"
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="final_verdict", job=job.id, pr=102, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert result["status"] == "queued"
+    assert result["stage"] == "merge_conflict_resolution"
+    assert github.merged == []
+    assert worktree_path.is_dir()
+    assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#12").returncode == 0
+    assert work_line is not None
+    assert work_line.line_id == ownership_metadata["line_id"]
+    assert work_line.branch_name == ownership_metadata["branch_name"]
+    assert work_line.worktree_path == ownership_metadata["worktree_path"]
+    assert work_line.repo_path == ownership_metadata["repo_path"]
+    assert work_line.auto_merge_state == "merge_conflict"
+    assert work_line.error == "merge conflict with base branch"
+    assert work_line.cleanup_state == "preserved"
+    assert work_line.retryable is True
+    resolution_jobs = service.storage.find_jobs(
+        repo_full_name="acme/demo", stage="merge_conflict_resolution", pr_number=102
+    )
+    assert len(resolution_jobs) == 1
+    assert [submitted_job.id for submitted_job in submitted_jobs] == [resolution_jobs[0].id]
+    assert resolution_jobs[0].metadata["conflict_reason"] == "merge conflict with base branch"
+    assert resolution_jobs[0].metadata["line_id"] == ownership_metadata["line_id"]
+    assert resolution_jobs[0].metadata["branch_name"] == ownership_metadata["branch_name"]
+    assert resolution_jobs[0].metadata["worktree_path"] == ownership_metadata["worktree_path"]
+    assert resolution_jobs[0].metadata["repo_path"] == ownership_metadata["repo_path"]
+    resolution_prompt = service._build_prompt(repo, resolution_jobs[0], runtime=RUNTIME_OMX)
+    assert f"Local path: {worktree_path}" in resolution_prompt
+
+    github.merge_conflicts.remove(("acme/demo", 102))
+    retry_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="merge_conflict_resolution", job=resolution_jobs[0].id, pr=102),
+        )
+    )
+    retry_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=102)
+    retry_job = retry_jobs[-1]
+    assert retry_result["stage"] == "final_verdict"
+    assert retry_job.metadata["line_id"] == ownership_metadata["line_id"]
+    assert retry_job.metadata["branch_name"] == ownership_metadata["branch_name"]
+    assert retry_job.metadata["worktree_path"] == ownership_metadata["worktree_path"]
+    assert retry_job.metadata["repo_path"] == ownership_metadata["repo_path"]
+
+    merged_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="final_verdict", job=retry_job.id, pr=102, verdict="APPROVE"),
+        )
+    )
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert merged_result == {"status": "merged", "pr_number": 102}
+    assert github.merged == [("acme/demo", 102)]
+    assert not worktree_path.exists()
+    assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#12", check=False).returncode != 0
+    assert work_line is not None
+    assert work_line.status == "merged"
+    assert work_line.auto_merge_state == "merged"
+    assert work_line.cleanup_state == "cleaned"
+    assert work_line.retryable is False
+
+
+def test_final_verdict_records_cleanup_failure_without_rolling_back_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=13,
+            pr_number=103,
+            metadata={"line_id": "issue-13"},
+        )
+    )
+    service._ensure_work_line(repo, job)
+    github.add_pull_request(
+        "acme/demo",
+        103,
+        "Implements #13",
+        title="Feature/#13",
+        head_branch="feature/#13",
+        base_branch="dev",
+    )
+
+    def fail_cleanup(repo_path: Path, *args: str) -> None:
+        msg = "cleanup unavailable"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(service, "_check_git_cleanup", fail_cleanup)
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=103,
+            body=build_signature(stage="final_verdict", job=job.id, pr=103, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-13")
+    updated_job = service.storage.get_job(job.id)
+    snapshot_work_lines = {line["line_id"]: line for line in service.state_snapshot()["work_lines"]["work_lines"]}
+    assert result == {"status": "merged", "pr_number": 103}
+    assert github.merged == [("acme/demo", 103)]
+    assert (tmp_path / ".dani-runs" / "worktrees" / "acme-demo" / "issue-13").is_dir()
+    assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#13").returncode == 0
+    assert work_line is not None
+    assert work_line.status == "merged"
+    assert work_line.auto_merge_state == "merged"
+    assert work_line.branch_name == "feature/#13"
+    assert work_line.repo_path == str(repo_path)
+    assert work_line.cleanup_state == "cleanup_failed"
+    assert work_line.cleanup_error == "cleanup unavailable"
+    assert work_line.retryable is False
+    assert updated_job is not None
+    assert updated_job.metadata["branch_name"] == "feature/#13"
+    assert updated_job.metadata["worktree_path"] == str(
+        tmp_path / ".dani-runs" / "worktrees" / "acme-demo" / "issue-13"
+    )
+    assert updated_job.metadata["repo_path"] == str(repo_path)
+    assert updated_job.metadata["cleanup_state"] == "cleanup_failed"
+    assert updated_job.metadata["cleanup_error"] == "cleanup unavailable"
+    assert snapshot_work_lines["issue-13"]["cleanup_state"] == "cleanup_failed"
+    assert snapshot_work_lines["issue-13"]["cleanup_error"] == "cleanup unavailable"
+    assert snapshot_work_lines["issue-13"]["branch_name"] == "feature/#13"
+    assert snapshot_work_lines["issue-13"]["worktree_path"] == updated_job.metadata["worktree_path"]
+
+
+def test_final_verdict_refuses_to_cleanup_protected_branch(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=14,
+            pr_number=104,
+            metadata={"line_id": "issue-14"},
+        )
+    )
+    service._ensure_work_line(repo, job)
+    job.metadata = {**job.metadata, "branch_name": "dev"}
+    service.storage.update_job(job.id, metadata=job.metadata)
+    github.add_pull_request("acme/demo", 104, "Implements #14", title="Feature/#14")
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=104,
+            body=build_signature(stage="final_verdict", job=job.id, pr=104, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-14")
+    updated_job = service.storage.get_job(job.id)
+    assert result == {"status": "merged", "pr_number": 104}
+    assert work_line is not None
+    assert work_line.cleanup_state == "cleanup_failed"
+    assert work_line.cleanup_error == "refusing to delete protected branch: dev"
+    assert updated_job is not None
+    assert updated_job.metadata["cleanup_error"] == "refusing to delete protected branch: dev"
+
+
+def test_final_verdict_refuses_to_cleanup_unmanaged_worktree_path(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=15,
+            pr_number=105,
+            metadata={"line_id": "issue-15"},
+        )
+    )
+    service._ensure_work_line(repo, job)
+    unmanaged_worktree = tmp_path / "outside-managed-root" / "issue-15"
+    job.metadata = {**job.metadata, "worktree_path": str(unmanaged_worktree)}
+    service.storage.update_job(job.id, metadata=job.metadata)
+    github.add_pull_request("acme/demo", 105, "Implements #15", title="Feature/#15")
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=105,
+            body=build_signature(stage="final_verdict", job=job.id, pr=105, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-15")
+    updated_job = service.storage.get_job(job.id)
+    assert result == {"status": "merged", "pr_number": 105}
+    assert work_line is not None
+    assert work_line.cleanup_state == "cleanup_failed"
+    assert work_line.cleanup_error == f"refusing to clean unmanaged worktree path: {unmanaged_worktree}"
+    assert updated_job is not None
+    assert updated_job.metadata["cleanup_error"] == f"refusing to clean unmanaged worktree path: {unmanaged_worktree}"
 
 
 def test_bootstrap_repo_queues_existing_open_issues(tmp_path: Path) -> None:
@@ -3323,6 +4514,7 @@ def test_service_rehydrates_queued_jobs_on_startup(tmp_path: Path) -> None:
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, runner),
         dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     restarted.wait_for_idle()
 
@@ -3359,6 +4551,7 @@ def test_service_recovers_launched_jobs_on_startup(tmp_path: Path) -> None:
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, runner),
         dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     restarted.wait_for_idle()
 
