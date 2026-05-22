@@ -2652,6 +2652,22 @@ def test_merge_conflict_resolution_comment_queues_final_verdict_retry(tmp_path: 
         base_branch="dev",
     )
 
+    source_job = service.storage.create_job(
+        JobRecord(
+            id="resolve-1",
+            repo_full_name="acme/demo",
+            stage="merge_conflict_resolution",
+            issue_number=5,
+            pr_number=77,
+            metadata={
+                "line_id": "issue-5",
+                "branch_name": "feature/#5",
+                "worktree_path": str(tmp_path / ".dani-worktrees" / "issue-5"),
+                "repo_path": str(tmp_path),
+            },
+        )
+    )
+
     resolution_event = NormalizedEvent(
         kind="pull_request_comment",
         repo_full_name="acme/demo",
@@ -2659,7 +2675,7 @@ def test_merge_conflict_resolution_comment_queues_final_verdict_retry(tmp_path: 
         number=77,
         actor_login="agent",
         payload={},
-        body=build_signature(stage="merge_conflict_resolution", job="resolve-1", pr=77),
+        body=build_signature(stage="merge_conflict_resolution", job=source_job.id, pr=77),
         title="Feature/#5",
         is_pull_request=True,
     )
@@ -2670,9 +2686,14 @@ def test_merge_conflict_resolution_comment_queues_final_verdict_retry(tmp_path: 
     verdict_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77)
     assert result["stage"] == "final_verdict"
     assert verdict_jobs
-    assert verdict_jobs[0].issue_number == 5
-    assert verdict_jobs[0].metadata["title"] == "Feature/#5"
-    assert verdict_jobs[0].metadata["body"] == pr_body
+    retry_job = verdict_jobs[0]
+    assert retry_job.issue_number == 5
+    assert retry_job.metadata["title"] == "Feature/#5"
+    assert retry_job.metadata["body"] == pr_body
+    assert retry_job.metadata["line_id"] == source_job.metadata["line_id"]
+    assert retry_job.metadata["branch_name"] == source_job.metadata["branch_name"]
+    assert retry_job.metadata["worktree_path"] == source_job.metadata["worktree_path"]
+    assert retry_job.metadata["repo_path"] == source_job.metadata["repo_path"]
     assert omx_runner.launches[-1]["job"].stage == "final_verdict"
 
 
@@ -3069,6 +3090,143 @@ def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed
     assert resolution_jobs[0].metadata["branch_name"] == ownership_metadata["branch_name"]
     assert resolution_jobs[0].metadata["worktree_path"] == ownership_metadata["worktree_path"]
     assert resolution_jobs[0].metadata["repo_path"] == ownership_metadata["repo_path"]
+
+
+def test_merge_conflict_resolution_retry_final_verdict_cleans_original_work_line(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+
+    submitted_jobs: list[JobRecord] = []
+
+    class CapturingQueue:
+        def submit(self, submitted_job: JobRecord) -> None:
+            submitted_jobs.append(submitted_job)
+
+        def join_all(self) -> None:
+            return None
+
+    service.queue_manager = CapturingQueue()
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    initial_verdict_job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=12,
+            pr_number=102,
+            metadata={"line_id": "issue-12"},
+        )
+    )
+    service._ensure_work_line(repo, initial_verdict_job)
+    ownership_metadata = {
+        "line_id": initial_verdict_job.metadata["line_id"],
+        "branch_name": initial_verdict_job.metadata["branch_name"],
+        "worktree_path": initial_verdict_job.metadata["worktree_path"],
+        "repo_path": initial_verdict_job.metadata["repo_path"],
+    }
+    github.add_pull_request(
+        "acme/demo",
+        102,
+        "Implements #12",
+        title="Feature/#12",
+        head_branch="feature/#12",
+        base_branch="dev",
+    )
+    github.merge_conflicts.add(("acme/demo", 102))
+
+    conflict_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="final_verdict", job=initial_verdict_job.id, pr=102, verdict="APPROVE"),
+        )
+    )
+
+    assert conflict_result["stage"] == "merge_conflict_resolution"
+    resolution_job = service.storage.find_jobs(
+        repo_full_name="acme/demo", stage="merge_conflict_resolution", pr_number=102
+    )[0]
+    github.merge_conflicts.remove(("acme/demo", 102))
+
+    retry_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="merge_conflict_resolution", job=resolution_job.id, pr=102),
+        )
+    )
+
+    assert retry_result["stage"] == "final_verdict"
+    retry_verdict_job = next(
+        job
+        for job in service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=102)
+        if job.id != initial_verdict_job.id
+    )
+    assert retry_verdict_job.metadata["line_id"] == ownership_metadata["line_id"]
+    assert retry_verdict_job.metadata["branch_name"] == ownership_metadata["branch_name"]
+    assert retry_verdict_job.metadata["worktree_path"] == ownership_metadata["worktree_path"]
+    assert retry_verdict_job.metadata["repo_path"] == ownership_metadata["repo_path"]
+
+    merge_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="final_verdict", job=retry_verdict_job.id, pr=102, verdict="APPROVE"),
+        )
+    )
+
+    worktree_path = Path(str(ownership_metadata["worktree_path"]))
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert [submitted_job.id for submitted_job in submitted_jobs] == [resolution_job.id, retry_verdict_job.id]
+    assert merge_result == {"status": "merged", "pr_number": 102}
+    assert github.merged == [("acme/demo", 102)]
+    assert not worktree_path.exists()
+    assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#12", check=False).returncode != 0
+    assert work_line is not None
+    assert work_line.status == "merged"
+    assert work_line.auto_merge_state == "merged"
+    assert work_line.cleanup_state == "cleaned"
+    assert work_line.retryable is False
+
+
+def test_merge_conflict_resolution_prompt_uses_worktree_path_when_present(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    worktree_path = tmp_path / ".dani-worktrees" / "issue-5"
+    job = JobRecord(
+        repo_full_name="acme/demo",
+        stage="merge_conflict_resolution",
+        issue_number=5,
+        pr_number=77,
+        metadata={
+            "worktree_path": str(worktree_path),
+            "head_branch": "feature/#5",
+            "base_branch": "dev",
+            "conflict_reason": "merge conflict with base branch",
+        },
+    )
+
+    prompt = service._build_merge_conflict_resolution_prompt(
+        repo,
+        job,
+        issue_number=5,
+        pr_number=77,
+        pr_title="Feature/#5",
+        pr_body="Implements #5",
+        runtime=RUNTIME_OMX,
+    )
+
+    assert f"Local path: {worktree_path}" in prompt
+    assert f"Local path: {repo.local_path}" not in prompt.splitlines()
 
 
 def test_final_verdict_records_cleanup_failure_without_rolling_back_merge(

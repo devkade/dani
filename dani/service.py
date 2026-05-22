@@ -467,6 +467,8 @@ class DaniService:
         issue_number = self._issue_number_for_signature_event(event.repo_full_name, signature, pr_number=pr_number)
         if issue_number is None:
             issue_number = self._extract_issue_number(pr_metadata.get("body"))
+        source_job = self.storage.get_job(signature.get("job", ""))
+        lineage_metadata = self._automation_lineage_metadata(source_job)
         verdict_job = self._enqueue_job(
             repo,
             stage="final_verdict",
@@ -474,6 +476,7 @@ class DaniService:
             pr_number=pr_number,
             metadata={
                 **pr_metadata,
+                **lineage_metadata,
                 "title": (pr_metadata.get("title") or event.title or ""),
             },
         )
@@ -1789,11 +1792,12 @@ class DaniService:
         pr_body: str,
         runtime: str,
     ) -> str:
+        local_path = str(job.metadata.get("worktree_path") or repo.local_path)
         return render_prompt(
             "merge_conflict_resolution",
             {
                 "repo": repo.full_name,
-                "local_path": repo.local_path,
+                "local_path": local_path,
                 "issue_number": issue_number,
                 "pr_number": pr_number,
                 "pr_title": pr_title,
