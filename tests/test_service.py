@@ -1417,11 +1417,8 @@ def test_review_fix_loop_repeats_in_same_work_line_until_final_approval(tmp_path
     assert work_line.review_state == "round_3_completed"
     assert work_line.auto_merge_state == "merged"
     assert work_line.retryable is False
-    assert work_line.agent_run_ids == [
-        service.storage.get_job(job_id).session_id
-        for job_id in line_job_ids
-        if service.storage.get_job(job_id) is not None
-    ]
+    line_jobs = [job for job_id in line_job_ids if (job := service.storage.get_job(job_id)) is not None]
+    assert work_line.agent_run_ids == [job.session_id for job in line_jobs]
 
 
 def test_review_fix_agent_commits_to_original_branch(tmp_path: Path) -> None:
@@ -3009,7 +3006,7 @@ def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed
         def join_all(self) -> None:
             return None
 
-    service.queue_manager = CapturingQueue()  # type: ignore[assignment]
+    service.queue_manager = CapturingQueue()
     service.register_repo("acme/demo", str(repo_path))
     repo = service.storage.get_repo("acme/demo")
     assert repo is not None

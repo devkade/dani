@@ -2038,7 +2038,8 @@ class DaniService:
         metadata = {**context.metadata(), **job.metadata}
         existing = self.storage.get_work_line(repo.full_name, context.line_id)
         existing_agent_run_ids = list(existing.agent_run_ids) if existing is not None else []
-        metadata_agent_run_ids = [str(item) for item in metadata.get("agent_run_ids", [])]
+        raw_agent_run_ids = metadata.get("agent_run_ids")
+        metadata_agent_run_ids = [str(item) for item in raw_agent_run_ids] if isinstance(raw_agent_run_ids, list) else []
         agent_run_ids = existing_agent_run_ids[:]
         for agent_run_id in metadata_agent_run_ids:
             if agent_run_id not in agent_run_ids:
