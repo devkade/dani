@@ -131,8 +131,8 @@ Requirements:
 - Use the existing isolated worktree and branch: $branch_name
 - Commit and push your changes to $branch_name
 - Ensure there is a PR targeting $dev_branch for $branch_name
-  - If no PR exists, create it with:
-    gh pr create --repo $repo --head $branch_name --base $dev_branch --title "Feature/#$issue_number" --body-file <pr-body.md>
+  - If no PR exists, create it with the bundled PyGithub helper:
+    python -m dani.github_helper ensure-pr --repo $repo --head $branch_name --base $dev_branch --title "Feature/#$issue_number" --body-file <pr-body.md>
   - If a PR already exists, push new commits to the same branch so the PR updates automatically
   - Update the PR body only if needed to keep the description/signature accurate
 $signature_instructions

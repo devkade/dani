@@ -92,6 +92,32 @@ def test_implementation_prompt_prefers_push_over_pr_edit_for_existing_pr() -> No
     assert "gh pr edit" not in prompt
 
 
+def test_implementation_prompt_creates_first_pr_with_dani_helper() -> None:
+    prompt = render_prompt(
+        "implementation",
+        {
+            "repo": "acme/demo",
+            "local_path": "workspace/demo",
+            "issue_number": 7,
+            "issue_title": "Need a bot",
+            "issue_body": "Implement it",
+            "discussion": "approved",
+            "pr_context": "",
+            "pr_number": "",
+            "dev_branch": "dev",
+            "branch_name": "feature/#7",
+            "signature": "<!-- dani:stage=implementation;job=abc;issue=7 -->",
+            "signature_instructions": "Use this signature in the PR body:\n<!-- dani:stage=implementation;job=abc;issue=7 -->",
+        },
+    )
+
+    assert (
+        "python -m dani.github_helper ensure-pr --repo acme/demo --head feature/#7 --base dev "
+        '--title "Feature/#7" --body-file <pr-body.md>'
+    ) in prompt
+    assert "gh pr create" not in prompt
+
+
 def test_implementation_prompt_for_existing_pr_requires_signed_followup_comment() -> None:
     prompt = render_prompt(
         "implementation",
