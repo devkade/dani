@@ -66,15 +66,14 @@ class GitWorkLineManager:
 
     @contextlib.contextmanager
     def _locked_allocation(self) -> Iterator[None]:
-        with self._allocation_lock:
-            with self._allocation_lock_path.open("a+", encoding="utf-8") as lock_file:
+        with self._allocation_lock, self._allocation_lock_path.open("a+", encoding="utf-8") as lock_file:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
                 if fcntl is not None:
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    if fcntl is not None:
-                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _context_for(self, repo: RepoConfig, job: JobRecord) -> WorkLineContext:
         issue_id = str(job.issue_number or job.metadata.get("issue_id") or "")

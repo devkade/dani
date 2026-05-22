@@ -170,7 +170,7 @@ class OmxRunner:
             'if [ "$current_branch" != "$expected_branch" ]; then\n'
             '  git checkout --quiet "$expected_branch"\n'
             '  current_branch="$(git branch --show-current)"\n'
-            'fi\n'
+            "fi\n"
             'if [ "$current_branch" != "$expected_branch" ]; then\n'
             '  echo "dani branch context mismatch: expected $expected_branch, got $current_branch" >&2\n'
             "  exit 1\n"
