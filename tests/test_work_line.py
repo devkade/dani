@@ -87,6 +87,27 @@ def test_git_work_line_manager_allocates_unique_branches_and_worktrees_concurren
         assert _git(context.worktree_path, "rev-parse", "--is-inside-work-tree").stdout.strip() == "true"
 
 
+def test_git_work_line_manager_creates_branch_and_worktree_for_new_line(tmp_path: Path) -> None:
+    repo_path = _init_repo(tmp_path)
+    repo = RepoConfig(full_name="acme/demo", local_path=str(repo_path))
+    manager = GitWorkLineManager(tmp_path / "runs")
+    job = JobRecord(repo_full_name=repo.full_name, stage="implementation", issue_number=11)
+
+    context = manager.prepare(repo, job)
+
+    assert context.line_id == "issue-11"
+    assert context.branch_name == "feature/#11"
+    assert context.worktree_path == tmp_path / "runs" / "worktrees" / "acme-demo" / "issue-11"
+    assert _git(repo_path, "show-ref", "--verify", "refs/heads/feature/#11").returncode == 0
+    assert (
+        _git(repo_path, "rev-parse", "feature/#11").stdout.strip()
+        == _git(repo_path, "rev-parse", "origin/dev").stdout.strip()
+    )
+    assert context.worktree_path.is_dir()
+    assert _git(context.worktree_path, "rev-parse", "--is-inside-work-tree").stdout.strip() == "true"
+    assert _git(context.worktree_path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feature/#11"
+
+
 def test_line_command_file_changes_stay_in_assigned_worktree(tmp_path: Path) -> None:
     repo_path = _init_repo(tmp_path)
     repo = RepoConfig(full_name="acme/demo", local_path=str(repo_path))
