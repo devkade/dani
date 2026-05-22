@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -550,12 +551,34 @@ class DaniService:
             issue_number = self._issue_number_for_signature_event(event.repo_full_name, signature, pr_number=pr_number)
             if issue_number is None:
                 issue_number = self._extract_issue_number(pull_request.get("body"))
+            line_metadata: dict[str, Any] = {}
+            if source_job is not None:
+                line_metadata = {
+                    key: source_job.metadata[key]
+                    for key in (
+                        "line_id",
+                        "issue_id",
+                        "pr_id",
+                        "branch_name",
+                        "worktree_path",
+                        "repo_path",
+                        "work_line_status",
+                        "agent_run_ids",
+                        "review_state",
+                        "auto_merge_state",
+                        "cleanup_state",
+                        "cleanup_error",
+                        "retryable",
+                    )
+                    if key in source_job.metadata
+                }
             merge_conflict_job = self._enqueue_job(
                 repo,
                 stage="merge_conflict_resolution",
                 issue_number=issue_number,
                 pr_number=pr_number,
                 metadata={
+                    **line_metadata,
                     "title": pull_request.get("title") or event.title or f"PR #{pr_number}",
                     "body": pull_request.get("body") or "",
                     "head_branch": self._branch_ref(pull_request, "head"),
@@ -567,6 +590,7 @@ class DaniService:
             return {"status": "queued", "job_id": merge_conflict_job.id, "stage": merge_conflict_job.stage}
         self.storage.record_processed_event(event_key)
         self._update_work_line_state(source_job, status="merged", auto_merge_state="merged", retryable=False)
+        self._cleanup_work_line_after_merge(source_job)
         return {"status": "merged", "pr_number": pr_number}
 
     def _handle_review_round_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
@@ -839,9 +863,7 @@ class DaniService:
         runner = self._runner_for_runtime(runtime)
         repo_path = self._runtime_repo_path(repo, job)
         if resume_session is not None and self._resume_runtime_for_session(resume_session) == runtime:
-            session = runner.resume(
-                repo_path, job, prompt, self._session_id_for_resume(job, resume_session)
-            )
+            session = runner.resume(repo_path, job, prompt, self._session_id_for_resume(job, resume_session))
         else:
             session = runner.launch(repo_path, job, prompt)
 
@@ -1598,7 +1620,11 @@ class DaniService:
         pr_discussion = self._render_pr_discussion(repo.full_name, pr_number) if pr_number else ""
         pr_context = ""
         if pr_number:
-            review_context = pr_discussion or job.metadata.get("review_comment_body", "")
+            review_comment_body = str(job.metadata.get("review_comment_body") or "").strip()
+            review_context_parts = [part for part in (pr_discussion, review_comment_body) if part]
+            if pr_discussion and review_comment_body and review_comment_body in pr_discussion:
+                review_context_parts = [pr_discussion]
+            review_context = "\n\n".join(review_context_parts)
             pr_context = (
                 f"Existing PR context:\n"
                 f"PR #{pr_number}: {pr_title}\n\n"
@@ -2010,6 +2036,13 @@ class DaniService:
     def _ensure_work_line(self, repo: RepoConfig, job: JobRecord) -> None:
         context = self.work_line_manager.prepare(repo, job)
         metadata = {**context.metadata(), **job.metadata}
+        existing = self.storage.get_work_line(repo.full_name, context.line_id)
+        existing_agent_run_ids = list(existing.agent_run_ids) if existing is not None else []
+        metadata_agent_run_ids = [str(item) for item in metadata.get("agent_run_ids", [])]
+        agent_run_ids = existing_agent_run_ids[:]
+        for agent_run_id in metadata_agent_run_ids:
+            if agent_run_id not in agent_run_ids:
+                agent_run_ids.append(agent_run_id)
         metadata["line_id"] = context.line_id
         metadata["issue_id"] = context.issue_id
         metadata["pr_id"] = context.pr_id
@@ -2017,10 +2050,16 @@ class DaniService:
         metadata["worktree_path"] = str(context.worktree_path)
         metadata["repo_path"] = str(context.repo_path)
         metadata["work_line_status"] = "worktree_ready"
-        metadata["cleanup_state"] = metadata.get("cleanup_state") or "preserved"
-        metadata["cleanup_error"] = metadata.get("cleanup_error") or ""
-        metadata["retryable"] = True
-        metadata["agent_run_ids"] = list(metadata.get("agent_run_ids", []))
+        metadata["review_state"] = (existing.review_state if existing else "") or metadata.get("review_state") or ""
+        metadata["auto_merge_state"] = (
+            (existing.auto_merge_state if existing else "") or metadata.get("auto_merge_state") or ""
+        )
+        metadata["cleanup_state"] = (
+            (existing.cleanup_state if existing else "") or metadata.get("cleanup_state") or "preserved"
+        )
+        metadata["cleanup_error"] = (existing.cleanup_error if existing else "") or metadata.get("cleanup_error") or ""
+        metadata["retryable"] = existing.retryable if existing is not None else metadata.get("retryable", True)
+        metadata["agent_run_ids"] = agent_run_ids
         self.storage.update_job(job.id, metadata=metadata)
         job.metadata = metadata
         self.storage.upsert_work_line(
@@ -2033,12 +2072,12 @@ class DaniService:
                 worktree_path=str(context.worktree_path),
                 repo_path=str(context.repo_path),
                 status="worktree_ready",
-                agent_run_ids=[str(item) for item in metadata.get("agent_run_ids", [])],
+                agent_run_ids=agent_run_ids,
                 review_state=str(metadata.get("review_state") or ""),
                 auto_merge_state=str(metadata.get("auto_merge_state") or ""),
                 cleanup_state=str(metadata.get("cleanup_state") or "preserved"),
                 cleanup_error=str(metadata.get("cleanup_error") or ""),
-                retryable=True,
+                retryable=bool(metadata.get("retryable", True)),
             )
         )
 
@@ -2096,6 +2135,57 @@ class DaniService:
             return
         with contextlib.suppress(KeyError):
             self.storage.update_work_line(job.repo_full_name, line_id, agent_run_id=agent_run_id, **changes)
+
+    def _cleanup_work_line_after_merge(self, job: JobRecord | None) -> None:
+        if job is None:
+            return
+        repo_path_value = job.metadata.get("repo_path")
+        worktree_path_value = job.metadata.get("worktree_path")
+        branch_name = job.metadata.get("branch_name")
+        if not isinstance(repo_path_value, str) or not isinstance(worktree_path_value, str):
+            return
+        if not isinstance(branch_name, str) or not branch_name:
+            return
+        repo_path = Path(repo_path_value)
+        worktree_path = Path(worktree_path_value)
+        if self._run_git_for_cleanup(repo_path, "rev-parse", "--git-dir").returncode != 0:
+            return
+        try:
+            if worktree_path.exists():
+                self._check_git_cleanup(repo_path, "worktree", "remove", "--force", str(worktree_path))
+            self._run_git_for_cleanup(repo_path, "worktree", "prune")
+            if (
+                self._run_git_for_cleanup(repo_path, "rev-parse", "--verify", f"refs/heads/{branch_name}").returncode
+                == 0
+            ):
+                self._check_git_cleanup(repo_path, "branch", "-D", branch_name)
+        except RuntimeError as exc:
+            self._record_work_line_cleanup(job, cleanup_state="cleanup_failed", cleanup_error=str(exc))
+            return
+        self._record_work_line_cleanup(job, cleanup_state="cleaned", cleanup_error="")
+
+    def _record_work_line_cleanup(self, job: JobRecord, *, cleanup_state: str, cleanup_error: str) -> None:
+        metadata = {**job.metadata, "cleanup_state": cleanup_state, "cleanup_error": cleanup_error}
+        with contextlib.suppress(KeyError):
+            updated = self.storage.update_job(job.id, metadata=metadata)
+            job.metadata = updated.metadata
+        self._update_work_line_state(job, cleanup_state=cleanup_state, cleanup_error=cleanup_error)
+
+    def _check_git_cleanup(self, repo_path: Path, *args: str) -> None:
+        result = self._run_git_for_cleanup(repo_path, *args)
+        if result.returncode != 0:
+            command = "git " + " ".join(args)
+            stderr = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            msg = f"{command}: {stderr}"
+            raise RuntimeError(msg)
+
+    def _run_git_for_cleanup(self, repo_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603
+            ["git", "-C", str(repo_path), *args],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
     def _queue_issue_followup(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
         session = self._latest_issue_lineage_session(event.repo_full_name, event.number)
@@ -2174,13 +2264,22 @@ class DaniService:
         if is_agent_managed_pr:
             if event.action != "opened":
                 return {"status": "ignored", "reason": "agent_managed_pr_followup"}
+            source_job = self.storage.get_job(signature.get("job", "")) if signature else None
+            lineage_metadata = self._automation_lineage_metadata(source_job)
+            if lineage_metadata.get("line_id"):
+                lineage_metadata["pr_id"] = str(event.number)
+                self._update_work_line_state(source_job, pr_id=str(event.number))
             job = self._enqueue_job(
                 repo,
                 stage="review_round",
                 issue_number=issue_number,
                 pr_number=event.number,
                 review_round=1,
-                metadata={"title": event.title or "", "body": event.body or ""},
+                metadata={
+                    **lineage_metadata,
+                    "title": event.title or "",
+                    "body": event.body or "",
+                },
             )
             return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
