@@ -45,11 +45,11 @@ def _line_command(path: Path, command: str) -> subprocess.CompletedProcess[str]:
 def _init_repo(tmp_path: Path) -> Path:
     origin = tmp_path / "origin.git"
     repo_path = tmp_path / "repo"
-    subprocess.run(  # noqa: S603,S607
-        ["git", "init", "--bare", str(origin)], check=True, capture_output=True, text=True
+    subprocess.run(  # noqa: S603
+        ["git", "init", "--bare", str(origin)], check=True, capture_output=True, text=True  # noqa: S607
     )
-    subprocess.run(  # noqa: S603,S607
-        ["git", "clone", str(origin), str(repo_path)], check=True, capture_output=True, text=True
+    subprocess.run(  # noqa: S603
+        ["git", "clone", str(origin), str(repo_path)], check=True, capture_output=True, text=True  # noqa: S607
     )
 
     (repo_path / "app.txt").write_text("base\n", encoding="utf-8")
