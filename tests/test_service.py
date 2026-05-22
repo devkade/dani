@@ -14,7 +14,7 @@ from dani.service import DaniService
 from dani.session_bridge import BridgeContext, OmoSessionBridge
 from dani.signatures import build_signature
 from dani.storage import JsonStorage
-from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner, FakeRuntimeRunner
+from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner, FakeRuntimeRunner, FakeWorkLineManager
 
 TEST_SECRET = "unit-test-secret"
 
@@ -55,6 +55,7 @@ def make_service(
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, omx_runner),
         dev_syncer=dev_syncer or FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, omx_runner
@@ -89,6 +90,7 @@ def make_omo_preferred_service(
         dev_syncer=dev_syncer or FakeGitDevSyncer(),
         runtime_runners={RUNTIME_OMX: cast(OmxRunner, omx_runner)},
         session_bridge=cast(OmoSessionBridge, bridge),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, omo_runner, omx_runner
@@ -995,6 +997,309 @@ def test_approve_comment_queues_implementation(tmp_path: Path) -> None:
     assert result["stage"] == "implementation"
     assert omx_runner.launches[0]["job"].stage == "implementation"
     assert service.storage.list_jobs()[0].status == "completed"
+
+
+def test_new_implementation_creates_isolated_work_line_before_launch(tmp_path: Path) -> None:
+    work_line_manager = FakeWorkLineManager()
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=work_line_manager,
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-11"
+    assert result["stage"] == "implementation"
+    assert work_line_manager.prepared == [
+        {
+            "repo_full_name": "acme/demo",
+            "job_id": job.id,
+            "line_id": "issue-11",
+            "branch_name": "feature/#11",
+            "worktree_path": str(expected_worktree),
+        }
+    ]
+    assert omx_runner.launches[0]["repo_path"] == str(expected_worktree)
+    assert job.metadata["line_id"] == "issue-11"
+    assert job.metadata["issue_id"] == "11"
+    assert job.metadata["branch_name"] == "feature/#11"
+    assert job.metadata["worktree_path"] == str(expected_worktree)
+    assert job.metadata["repo_path"] == str(tmp_path)
+    assert job.metadata["cleanup_state"] == "preserved"
+    assert job.metadata["retryable"] is True
+    assert job.metadata["agent_run_ids"] == [job.session_id]
+    work_line = service.storage.get_work_line("acme/demo", "issue-11")
+    assert work_line is not None
+    assert work_line.status == "agent_completed"
+    assert work_line.issue_id == "11"
+    assert work_line.branch_name == "feature/#11"
+    assert work_line.worktree_path == str(expected_worktree)
+    assert work_line.agent_run_ids == [job.session_id]
+    assert work_line.cleanup_state == "preserved"
+    assert work_line.retryable is True
+
+
+def test_sibling_implementation_work_line_states_do_not_overwrite_each_other(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+
+    for issue_number in (11, 12):
+        service.handle_event(
+            NormalizedEvent(
+                kind="issue_comment",
+                repo_full_name="acme/demo",
+                action="created",
+                number=issue_number,
+                actor_login="acme",
+                payload={"issue": {"body": f"context {issue_number}"}, "comment": {"id": issue_number}},
+                body="/approve",
+                title=f"Need automation {issue_number}",
+            )
+        )
+    service.wait_for_idle()
+
+    first_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    second_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[0]
+    first = service.storage.get_work_line("acme/demo", "issue-11")
+    second = service.storage.get_work_line("acme/demo", "issue-12")
+
+    assert first is not None
+    assert second is not None
+    assert first.issue_id == "11"
+    assert first.branch_name == "feature/#11"
+    assert first.worktree_path.endswith(".dani-worktrees/issue-11")
+    assert first.agent_run_ids == [first_job.session_id]
+    assert second.issue_id == "12"
+    assert second.branch_name == "feature/#12"
+    assert second.worktree_path.endswith(".dani-worktrees/issue-12")
+    assert second.agent_run_ids == [second_job.session_id]
+    assert first.agent_run_ids != second.agent_run_ids
+
+
+def test_final_verdict_updates_only_own_work_line_merge_state(tmp_path: Path) -> None:
+    service, github, _ = make_service(tmp_path)
+
+    for issue_number in (21, 22):
+        service.handle_event(
+            NormalizedEvent(
+                kind="issue_comment",
+                repo_full_name="acme/demo",
+                action="created",
+                number=issue_number,
+                actor_login="acme",
+                payload={"issue": {"body": f"context {issue_number}"}, "comment": {"id": issue_number}},
+                body="/approve",
+                title=f"Need automation {issue_number}",
+            )
+        )
+    service.wait_for_idle()
+    first_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=21)[0]
+    second_before = service.storage.get_work_line("acme/demo", "issue-22")
+    assert second_before is not None
+
+    final_verdict_job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=21,
+            pr_number=101,
+            metadata={**first_job.metadata, "title": "Feature/#21", "body": ""},
+        )
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="final_verdict", job=final_verdict_job.id, pr=101, verdict="APPROVE"),
+        )
+    )
+
+    first_after = service.storage.get_work_line("acme/demo", "issue-21")
+    second_after = service.storage.get_work_line("acme/demo", "issue-22")
+    assert result == {"status": "merged", "pr_number": 101}
+    assert github.merged == [("acme/demo", 101)]
+    assert first_after is not None
+    assert first_after.status == "merged"
+    assert first_after.auto_merge_state == "merged"
+    assert first_after.retryable is False
+    assert second_after is not None
+    assert second_after.auto_merge_state == second_before.auto_merge_state
+    assert second_after.retryable == second_before.retryable
+
+
+def test_review_fix_reuses_original_isolated_work_line(tmp_path: Path) -> None:
+    work_line_manager = FakeWorkLineManager()
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=work_line_manager,
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+
+    implementation_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
+        )
+    )
+    service.wait_for_idle()
+    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
+
+    review_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="review_round", job=review_job.id, pr=101, round=1),
+        )
+    )
+    service.wait_for_idle()
+
+    implementation_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)
+    review_fix_job = implementation_jobs[-1]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-11"
+    assert implementation_result["stage"] == "review_round"
+    assert review_result["stage"] == "implementation"
+    assert work_line_manager.prepared == [
+        {
+            "repo_full_name": "acme/demo",
+            "job_id": initial_job.id,
+            "line_id": "issue-11",
+            "branch_name": "feature/#11",
+            "worktree_path": str(expected_worktree),
+        },
+        {
+            "repo_full_name": "acme/demo",
+            "job_id": review_fix_job.id,
+            "line_id": "issue-11",
+            "branch_name": "feature/#11",
+            "worktree_path": str(expected_worktree),
+        },
+    ]
+    assert omx_runner.launches[-1]["job"].id == review_fix_job.id
+    assert omx_runner.launches[-1]["repo_path"] == str(expected_worktree)
+    assert review_fix_job.metadata["line_id"] == "issue-11"
+    assert review_fix_job.metadata["worktree_path"] == str(expected_worktree)
+    assert review_fix_job.metadata["agent_run_ids"] == [initial_job.session_id, review_fix_job.session_id]
+    work_line = service.storage.get_work_line("acme/demo", "issue-11")
+    assert work_line is not None
+    assert work_line.agent_run_ids == [initial_job.session_id, review_fix_job.session_id]
+
+
+def test_implementation_executes_with_preferred_runtime_inside_work_line(tmp_path: Path) -> None:
+    service, _, omo_runner, omx_runner = make_omo_preferred_service(tmp_path)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=12,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need OMO implementation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[0]
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-12"
+    assert result["stage"] == "implementation"
+    assert job.status == "completed"
+    assert omo_runner.launches[0]["repo_path"] == str(expected_worktree)
+    assert "$ralph" not in omo_runner.launches[0]["prompt"]
+    assert "ultrawork" in omo_runner.launches[0]["prompt"]
+    assert omx_runner.launches == []
+    assert job.metadata["preferred_runtime"] == RUNTIME_OMO
+    assert job.metadata["effective_runtime"] == RUNTIME_OMO
+    assert job.metadata["native_session_runtime"] == RUNTIME_OMO
+    assert job.metadata["worktree_path"] == str(expected_worktree)
+    assert job.metadata["agent_run_ids"] == [job.session_id]
+
+
+def test_implementation_runtime_fallback_stays_inside_same_work_line(tmp_path: Path) -> None:
+    service, _, omo_runner, omx_runner = make_omo_preferred_service(tmp_path)
+    omo_runner.queue_wait_error(
+        ClaudeUsageLimitError(
+            "Claude usage limit reached",
+            "Claude usage limit reached",
+            "session_window",
+            reset_hint="in 5 hours",
+            suggested_retry_at="2026-04-22T08:00:00+00:00",
+        )
+    )
+
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=13,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need fallback implementation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=13)[0]
+    sessions = service.storage.list_sessions()
+    expected_worktree = tmp_path / ".dani-worktrees" / "issue-13"
+    assert job.status == "completed"
+    assert [launch["repo_path"] for launch in omo_runner.launches] == [str(expected_worktree)]
+    assert [launch["repo_path"] for launch in omx_runner.launches] == [str(expected_worktree)]
+    assert "ultrawork" in omo_runner.launches[0]["prompt"]
+    assert "$ralph" in omx_runner.launches[0]["prompt"]
+    assert job.metadata["preferred_runtime"] == RUNTIME_OMO
+    assert job.metadata["effective_runtime"] == RUNTIME_OMX
+    assert job.metadata["fallback_reason"] == "claude_session_window_limit"
+    assert job.metadata["worktree_path"] == str(expected_worktree)
+    assert job.metadata["agent_run_ids"] == [session.id for session in sessions]
+    assert [session.worktree_path for session in sessions] == [str(expected_worktree), str(expected_worktree)]
+    assert [session.status for session in sessions] == ["failed", "completed"]
 
 
 def test_approve_from_repo_owner_login_queues_implementation(tmp_path: Path) -> None:
@@ -3323,6 +3628,7 @@ def test_service_rehydrates_queued_jobs_on_startup(tmp_path: Path) -> None:
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, runner),
         dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     restarted.wait_for_idle()
 
@@ -3359,6 +3665,7 @@ def test_service_recovers_launched_jobs_on_startup(tmp_path: Path) -> None:
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, runner),
         dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     restarted.wait_for_idle()
 

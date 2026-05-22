@@ -1,6 +1,7 @@
+import threading
 from pathlib import Path
 
-from dani.models import DaniConfig, JobRecord, RepoConfig, SessionRecord
+from dani.models import DaniConfig, JobRecord, RepoConfig, SessionRecord, WorkLineRecord
 from dani.storage import JsonStorage
 
 TEST_SECRET = "unit-test-secret"
@@ -87,6 +88,74 @@ def test_storage_round_trips_runtime_metadata_and_filters_by_effective_runtime(t
     assert latest_omx.fallback_reason == "claude_weekly_limit"
     assert latest_omx.bridge_source_runtime == "omo"
     assert latest_omx.bridge_source_session_id == "ses_omo123"
+
+
+def test_work_line_state_updates_are_isolated_under_parallel_writes(tmp_path: Path) -> None:
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    repo = RepoConfig(full_name="acme/demo", local_path=str(tmp_path))
+    storage.register_repo(repo)
+    storage.upsert_work_line(
+        WorkLineRecord(
+            repo_full_name=repo.full_name,
+            line_id="issue-1",
+            issue_id="1",
+            branch_name="feature/#1",
+            worktree_path=str(tmp_path / "wt-1"),
+            repo_path=str(tmp_path),
+        )
+    )
+    storage.upsert_work_line(
+        WorkLineRecord(
+            repo_full_name=repo.full_name,
+            line_id="issue-2",
+            issue_id="2",
+            branch_name="feature/#2",
+            worktree_path=str(tmp_path / "wt-2"),
+            repo_path=str(tmp_path),
+        )
+    )
+
+    def update_line(line_id: str, agent_prefix: str, review_state: str, auto_merge_state: str, error: str) -> None:
+        for index in range(20):
+            storage.update_work_line(
+                repo.full_name,
+                line_id,
+                agent_run_id=f"{agent_prefix}-{index}",
+                status="agent_running",
+                review_state=review_state,
+                auto_merge_state=auto_merge_state,
+                error=error,
+            )
+
+    threads = [
+        threading.Thread(
+            target=update_line,
+            args=("issue-1", "agent-a", "round_1_completed", "verdict_running", "line-1-error"),
+        ),
+        threading.Thread(
+            target=update_line,
+            args=("issue-2", "agent-b", "round_2_completed", "merged", "line-2-error"),
+        ),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    first = storage.get_work_line(repo.full_name, "issue-1")
+    second = storage.get_work_line(repo.full_name, "issue-2")
+
+    assert first is not None
+    assert second is not None
+    assert first.review_state == "round_1_completed"
+    assert first.auto_merge_state == "verdict_running"
+    assert first.error == "line-1-error"
+    assert first.agent_run_ids == [f"agent-a-{index}" for index in range(20)]
+    assert second.review_state == "round_2_completed"
+    assert second.auto_merge_state == "merged"
+    assert second.error == "line-2-error"
+    assert second.agent_run_ids == [f"agent-b-{index}" for index in range(20)]
 
 
 def test_find_latest_session_can_filter_by_source_job_id(tmp_path: Path) -> None:

@@ -13,8 +13,7 @@ def create_app(service: DaniService) -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post("/webhook")
-    async def github_webhook(request: Request) -> dict[str, object]:
+    async def handle_github_webhook(request: Request) -> dict[str, object]:
         body = await request.body()
         signature = request.headers.get("x-hub-signature-256")
         if not verify_github_signature(service.config.webhook_secret, body, signature):
@@ -27,5 +26,13 @@ def create_app(service: DaniService) -> FastAPI:
         if event is None:
             return {"status": "ignored", "reason": "unsupported_event"}
         return service.handle_event(event)
+
+    @app.post("/webhook")
+    async def github_webhook(request: Request) -> dict[str, object]:
+        return await handle_github_webhook(request)
+
+    @app.post("/github/webhook")
+    async def github_webhook_alias(request: Request) -> dict[str, object]:
+        return await handle_github_webhook(request)
 
     return app

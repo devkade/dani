@@ -86,6 +86,30 @@ class SessionRecord:
         return asdict(self)
 
 
+@dataclass(slots=True)
+class WorkLineRecord:
+    repo_full_name: str
+    line_id: str
+    issue_id: str = ""
+    pr_id: str = ""
+    branch_name: str = ""
+    worktree_path: str = ""
+    repo_path: str = ""
+    status: str = "initialized"
+    agent_run_ids: list[str] = field(default_factory=list)
+    review_state: str = ""
+    auto_merge_state: str = ""
+    cleanup_state: str = "preserved"
+    cleanup_error: str = ""
+    retryable: bool = True
+    error: str = ""
+    created_at: str = field(default_factory=utc_now)
+    updated_at: str = field(default_factory=utc_now)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def effective_session_runtime(session: SessionRecord) -> str | None:
     if session.effective_runtime:
         return session.effective_runtime
@@ -158,6 +182,10 @@ class DaniConfig:
     @property
     def terminal_targets_path(self) -> Path:
         return self.data_dir / "terminal-targets.json"
+
+    @property
+    def work_lines_path(self) -> Path:
+        return self.data_dir / "work-lines.json"
 
     @property
     def run_dir(self) -> Path:

@@ -17,7 +17,7 @@ from dani.github import GitHubCLI
 from dani.models import DaniConfig, NormalizedEvent
 from dani.service import RETRY_BACKOFF_SECONDS, DaniService
 from dani.storage import JsonStorage
-from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner
+from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner, FakeWorkLineManager
 
 _CAPACITY_MSG = "capacity"
 
@@ -37,6 +37,7 @@ def make_service(
         github=cast(GitHubCLI, github),
         omx_runner=cast(AgentRunner, omx_runner),
         dev_syncer=dev_syncer or FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, omx_runner

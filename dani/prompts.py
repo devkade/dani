@@ -128,11 +128,11 @@ Requirements:
 - Write tests first (TDD)
 - Make all tests pass
 - Actually run the code and verify behavior
-- Create/update branch named like feature/#$issue_number
-- Commit and push your changes to feature/#$issue_number
-- Ensure there is a PR targeting $dev_branch for feature/#$issue_number
+- Use the existing isolated worktree and branch: $branch_name
+- Commit and push your changes to $branch_name
+- Ensure there is a PR targeting $dev_branch for $branch_name
   - If no PR exists, create it with:
-    gh pr create --repo $repo --head feature/#$issue_number --base $dev_branch --title "Feature/#$issue_number" --body-file <pr-body.md>
+    gh pr create --repo $repo --head $branch_name --base $dev_branch --title "Feature/#$issue_number" --body-file <pr-body.md>
   - If a PR already exists, push new commits to the same branch so the PR updates automatically
   - Update the PR body only if needed to keep the description/signature accurate
 $signature_instructions
@@ -286,6 +286,7 @@ def render_prompt(template_name: str, context: dict[str, Any], *, runtime: str =
     context.setdefault("review_cycle", "")
     context.setdefault("round_total", "3")
     context.setdefault("review_mode_note", "")
+    context.setdefault("branch_name", "")
     if template_name != "final_verdict" and "signature" not in context:
         context = {
             **context,

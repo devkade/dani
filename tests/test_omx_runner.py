@@ -1,14 +1,33 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
 from dani.errors import RolloutMissingError
+from dani.models import JobRecord
 from dani.omx_runner import OmxRunner
 from dani.signatures import build_signature
+
+
+def _git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    env = os.environ | {
+        "GIT_AUTHOR_NAME": "Tester",
+        "GIT_AUTHOR_EMAIL": "tester@example.com",
+        "GIT_COMMITTER_NAME": "Tester",
+        "GIT_COMMITTER_EMAIL": "tester@example.com",
+    }
+    return subprocess.run(  # noqa: S603
+        ["git", "-C", str(path), *args],  # noqa: S607
+        check=check,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
 
 
 def test_capture_omx_session_id_matches_exec_signature_and_repo_path(tmp_path: Path) -> None:
@@ -94,6 +113,75 @@ def test_build_script_uses_omx_exec(tmp_path: Path) -> None:
     script = runner._build_script(repo_path=tmp_path / "repo", prompt_path=tmp_path / "prompt.txt")
 
     assert "omx exec --dangerously-bypass-approvals-and-sandbox" in script
+
+
+def test_launch_command_observes_assigned_worktree_as_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    worktree_path = tmp_path / "repo" / ".dani-worktrees" / "issue-77"
+    worktree_path.mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_omx = bin_dir / "omx"
+    fake_omx.write_text("#!/bin/sh\npwd\n", encoding="utf-8")
+    fake_omx.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    runner = OmxRunner(run_dir=tmp_path / "runs")
+    job = JobRecord(repo_full_name="acme/demo", stage="implementation", issue_number=77)
+
+    session = runner.launch(worktree_path, job, "Implement issue 77.")
+    try:
+        runner.wait(session.runtime_handle, timeout_seconds=5)
+    finally:
+        runner.close_session(session.runtime_handle)
+
+    stdout = Path(session.stdout_path or "").read_text(encoding="utf-8").splitlines()
+    assert stdout == [str(worktree_path)]
+    assert session.worktree_path == str(worktree_path)
+
+
+def test_launch_command_checks_out_assigned_branch_before_git_operations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    _git(repo_path, "init")
+    (repo_path / "app.txt").write_text("base\n", encoding="utf-8")
+    _git(repo_path, "add", "app.txt")
+    _git(repo_path, "commit", "-m", "initial")
+    _git(repo_path, "branch", "-M", "main")
+    _git(repo_path, "checkout", "-b", "feature/#77")
+    _git(repo_path, "checkout", "main")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_omx = bin_dir / "omx"
+    fake_omx.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "git branch --show-current > branch.txt\n"
+        "printf 'agent\\n' >> app.txt\n"
+        "git add app.txt branch.txt\n"
+        "git commit -m agent\n",
+        encoding="utf-8",
+    )
+    fake_omx.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    runner = OmxRunner(run_dir=tmp_path / "runs")
+    job = JobRecord(
+        repo_full_name="acme/demo",
+        stage="implementation",
+        issue_number=77,
+        metadata={"branch_name": "feature/#77"},
+    )
+
+    session = runner.launch(repo_path, job, "Implement issue 77.")
+    try:
+        runner.wait(session.runtime_handle, timeout_seconds=5)
+    finally:
+        runner.close_session(session.runtime_handle)
+
+    assert _git(repo_path, "show", "feature/#77:branch.txt").stdout.strip() == "feature/#77"
+    assert _git(repo_path, "show", "main:branch.txt", check=False).returncode != 0
+    assert _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "feature/#77"
 
 
 def test_build_resume_script_uses_omx_exec_resume(tmp_path: Path) -> None:
