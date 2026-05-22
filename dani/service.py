@@ -2155,6 +2155,10 @@ class DaniService:
         worktree_path = Path(worktree_path_value)
         if self._run_git_for_cleanup(repo_path, "rev-parse", "--git-dir").returncode != 0:
             return
+        safety_error = self._work_line_cleanup_safety_error(job, worktree_path, branch_name)
+        if safety_error:
+            self._record_work_line_cleanup(job, cleanup_state="cleanup_failed", cleanup_error=safety_error)
+            return
         try:
             if worktree_path.exists():
                 self._check_git_cleanup(repo_path, "worktree", "remove", "--force", str(worktree_path))
@@ -2168,6 +2172,26 @@ class DaniService:
             self._record_work_line_cleanup(job, cleanup_state="cleanup_failed", cleanup_error=str(exc))
             return
         self._record_work_line_cleanup(job, cleanup_state="cleaned", cleanup_error="")
+
+    def _work_line_cleanup_safety_error(self, job: JobRecord, worktree_path: Path, branch_name: str) -> str:
+        repo = self.storage.get_repo(job.repo_full_name)
+        protected_branches = {"main", "master", "dev"}
+        if repo is not None:
+            protected_branches.update({repo.main_branch, repo.dev_branch})
+        if branch_name in protected_branches:
+            return f"refusing to delete protected branch: {branch_name}"
+
+        managed_root = self.work_line_manager.worktrees_dir.resolve(strict=False)
+        resolved_worktree_path = worktree_path.resolve(strict=False)
+        if not resolved_worktree_path.is_relative_to(managed_root):
+            return f"refusing to clean unmanaged worktree path: {worktree_path}"
+
+        head_branch = job.metadata.get("head_branch")
+        if branch_name.startswith(("feature/#", "dani/")):
+            return ""
+        if isinstance(head_branch, str) and head_branch and branch_name == head_branch:
+            return ""
+        return f"refusing to delete unmanaged branch: {branch_name}"
 
     def _record_work_line_cleanup(self, job: JobRecord, *, cleanup_state: str, cleanup_error: str) -> None:
         metadata = {**job.metadata, "cleanup_state": cleanup_state, "cleanup_error": cleanup_error}

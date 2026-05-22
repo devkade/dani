@@ -3184,6 +3184,101 @@ def test_final_verdict_records_cleanup_failure_without_rolling_back_merge(
     assert snapshot_work_lines["issue-13"]["worktree_path"] == updated_job.metadata["worktree_path"]
 
 
+def test_final_verdict_refuses_to_cleanup_protected_branch(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=14,
+            pr_number=104,
+            metadata={"line_id": "issue-14"},
+        )
+    )
+    service._ensure_work_line(repo, job)
+    job.metadata = {**job.metadata, "branch_name": "dev"}
+    service.storage.update_job(job.id, metadata=job.metadata)
+    github.add_pull_request("acme/demo", 104, "Implements #14", title="Feature/#14")
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=104,
+            body=build_signature(stage="final_verdict", job=job.id, pr=104, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-14")
+    updated_job = service.storage.get_job(job.id)
+    assert result == {"status": "merged", "pr_number": 104}
+    assert work_line is not None
+    assert work_line.cleanup_state == "cleanup_failed"
+    assert work_line.cleanup_error == "refusing to delete protected branch: dev"
+    assert updated_job is not None
+    assert updated_job.metadata["cleanup_error"] == "refusing to delete protected branch: dev"
+
+
+def test_final_verdict_refuses_to_cleanup_unmanaged_worktree_path(tmp_path: Path) -> None:
+    repo_path = _init_git_repo(tmp_path)
+    config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeOmxRunner(github)),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=GitWorkLineManager(tmp_path / ".dani-runs"),
+    )
+    service.register_repo("acme/demo", str(repo_path))
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="final_verdict",
+            issue_number=15,
+            pr_number=105,
+            metadata={"line_id": "issue-15"},
+        )
+    )
+    service._ensure_work_line(repo, job)
+    unmanaged_worktree = tmp_path / "outside-managed-root" / "issue-15"
+    job.metadata = {**job.metadata, "worktree_path": str(unmanaged_worktree)}
+    service.storage.update_job(job.id, metadata=job.metadata)
+    github.add_pull_request("acme/demo", 105, "Implements #15", title="Feature/#15")
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=105,
+            body=build_signature(stage="final_verdict", job=job.id, pr=105, verdict="APPROVE"),
+        )
+    )
+
+    work_line = service.storage.get_work_line("acme/demo", "issue-15")
+    updated_job = service.storage.get_job(job.id)
+    assert result == {"status": "merged", "pr_number": 105}
+    assert work_line is not None
+    assert work_line.cleanup_state == "cleanup_failed"
+    assert work_line.cleanup_error == f"refusing to clean unmanaged worktree path: {unmanaged_worktree}"
+    assert updated_job is not None
+    assert updated_job.metadata["cleanup_error"] == f"refusing to clean unmanaged worktree path: {unmanaged_worktree}"
+
+
 def test_bootstrap_repo_queues_existing_open_issues(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
     github.open_issues["acme/demo"] = [
