@@ -3069,6 +3069,40 @@ def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed
     assert resolution_jobs[0].metadata["branch_name"] == ownership_metadata["branch_name"]
     assert resolution_jobs[0].metadata["worktree_path"] == ownership_metadata["worktree_path"]
     assert resolution_jobs[0].metadata["repo_path"] == ownership_metadata["repo_path"]
+    resolution_prompt = service._build_prompt(repo, resolution_jobs[0], runtime=RUNTIME_OMX)
+    assert f"Local path: {worktree_path}" in resolution_prompt
+
+    github.merge_conflicts.remove(("acme/demo", 102))
+    retry_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="merge_conflict_resolution", job=resolution_jobs[0].id, pr=102),
+        )
+    )
+    retry_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=102)
+    retry_job = retry_jobs[-1]
+    assert retry_result["stage"] == "final_verdict"
+    assert retry_job.metadata["line_id"] == ownership_metadata["line_id"]
+    assert retry_job.metadata["branch_name"] == ownership_metadata["branch_name"]
+    assert retry_job.metadata["worktree_path"] == ownership_metadata["worktree_path"]
+    assert retry_job.metadata["repo_path"] == ownership_metadata["repo_path"]
+
+    merged_result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=102,
+            body=build_signature(stage="final_verdict", job=retry_job.id, pr=102, verdict="APPROVE"),
+        )
+    )
+    work_line = service.storage.get_work_line("acme/demo", "issue-12")
+    assert merged_result == {"status": "merged", "pr_number": 102}
+    assert github.merged == [("acme/demo", 102)]
+    assert not worktree_path.exists()
+    assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#12", check=False).returncode != 0
+    assert work_line is not None
+    assert work_line.status == "merged"
+    assert work_line.auto_merge_state == "merged"
+    assert work_line.cleanup_state == "cleaned"
+    assert work_line.retryable is False
 
 
 def test_final_verdict_records_cleanup_failure_without_rolling_back_merge(
