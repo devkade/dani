@@ -2462,6 +2462,9 @@ class DaniService:
 
         issue_number = self._pull_request_issue_number(event, signature)
         if is_agent_managed_pr:
+            event_key = self._pull_request_opened_delivery_event_key(event)
+            if event_key is not None and not self.storage.record_processed_event(event_key):
+                return {"status": "ignored", "reason": "duplicate_pull_request_event"}
             if event.action != "opened":
                 return {"status": "ignored", "reason": "agent_managed_pr_followup"}
             source_job = self.storage.get_job(signature.get("job", "")) if signature else None
@@ -2643,6 +2646,11 @@ class DaniService:
         if updated_at:
             fields.append(("updated_at", str(updated_at)))
         return ";".join(f"{key}={value}" for key, value in fields)
+
+    def _pull_request_opened_delivery_event_key(self, event: NormalizedEvent) -> str | None:
+        if event.delivery_id:
+            return f"pull_request_event;delivery={event.delivery_id}"
+        return None
 
     def _latest_review_round(self, repo_full_name: str, pr_number: int) -> int:
         rounds = [

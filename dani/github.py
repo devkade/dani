@@ -11,6 +11,7 @@ from github.GithubException import GithubException, UnknownObjectException
 from dani.signatures import is_opt_out_comment, parse_agent_signature
 
 TOKEN_ENV_VARS = ("DANI_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_PAT")
+TLS_CA_BUNDLE_ENV_VARS = ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE")
 LOGGER = logging.getLogger(__name__)
 MERGE_CONFLICT_STATUSES = frozenset({405, 409, 422})
 IMPLEMENTING_LABEL_COLOR = "FBCA04"
@@ -42,6 +43,13 @@ class GitHubCLI:
     def _build_client(self, token: str) -> Github:
         return Github(auth=Auth.Token(token))
 
+    def _clear_invalid_tls_ca_bundle_env(self) -> None:
+        for env_var in TLS_CA_BUNDLE_ENV_VARS:
+            value = os.environ.get(env_var)
+            if value and not os.path.exists(value):
+                LOGGER.warning("invalid_tls_ca_bundle_env_ignored", extra={"env_var": env_var, "path": value})
+                os.environ.pop(env_var, None)
+
     def _resolve_token(self) -> str:
         if self._token:
             return self._token
@@ -55,6 +63,7 @@ class GitHubCLI:
 
     def _client_for_request(self) -> Any:
         if self._client is None:
+            self._clear_invalid_tls_ca_bundle_env()
             self._client = self._client_factory(self._resolve_token())
         return self._client
 

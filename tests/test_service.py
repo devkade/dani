@@ -1910,6 +1910,50 @@ def test_pr_opened_from_implementation_signature_queues_review_round(tmp_path: P
     assert omx_runner.launches[-1]["job"].stage == "review_round"
 
 
+def test_duplicate_agent_managed_pr_delivery_is_ignored(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=12,
+            actor_login="acme",
+            payload={"issue": {"body": "Ship it"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Ship it",
+        )
+    )
+    service.wait_for_idle()
+    implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[
+        0
+    ]
+    pr_event = NormalizedEvent(
+        kind="pull_request_opened",
+        repo_full_name="acme/demo",
+        action="opened",
+        number=99,
+        actor_login="agent",
+        payload={},
+        body=f"Implements #12\n{build_signature(stage='implementation', job=implementation_job.id, issue=12)}",
+        title="Feature/#12",
+        base_branch="dev",
+        head_branch="Feature/#12",
+        is_pull_request=True,
+        delivery_id="delivery-99",
+    )
+
+    first = service.handle_event(pr_event)
+    duplicate = service.handle_event(pr_event)
+    service.wait_for_idle()
+
+    review_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=99)
+    assert first["stage"] == "review_round"
+    assert duplicate == {"status": "ignored", "reason": "duplicate_pull_request_event"}
+    assert [job.review_round for job in review_jobs] == [1]
+    assert [launch["job"].stage for launch in omx_runner.launches].count("review_round") == 1
+
+
 def test_implementation_pr_creation_keeps_agent_owned_branch_and_worktree(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
     service.handle_event(
