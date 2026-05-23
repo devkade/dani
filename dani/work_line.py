@@ -64,6 +64,11 @@ class GitWorkLineManager:
             self._run_git(context.repo_path, "worktree", "add", str(context.worktree_path), context.branch_name)
             return context
 
+    def planned_metadata(self, repo: RepoConfig, job: JobRecord) -> dict[str, object]:
+        """Return deterministic work-line metadata without touching git state."""
+
+        return self._context_for(repo, job).metadata()
+
     @contextlib.contextmanager
     def _locked_allocation(self) -> Iterator[None]:
         with self._allocation_lock, self._allocation_lock_path.open("a+", encoding="utf-8") as lock_file:

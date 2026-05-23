@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 from github.GithubException import GithubException, UnknownObjectException
 
@@ -183,6 +185,21 @@ def test_prefers_dani_github_token_env_var(monkeypatch: pytest.MonkeyPatch, fake
     github.list_open_issues("acme/demo")
 
     assert used_tokens == ["preferred-token"]
+
+
+def test_ignores_stale_tls_ca_bundle_env_var(
+    monkeypatch: pytest.MonkeyPatch, fake_repo: FakeRepo, tmp_path
+) -> None:
+    missing_bundle = str(tmp_path / "missing-cacert.pem")
+
+    monkeypatch.setenv("DANI_GITHUB_TOKEN", "token")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", missing_bundle)
+
+    github = GitHubCLI(client_factory=lambda _token: FakeClient(fake_repo))
+
+    github.list_open_issues("acme/demo")
+
+    assert "REQUESTS_CA_BUNDLE" not in os.environ
 
 
 def test_create_issue_and_pr_comments_use_repository_objects(fake_repo: FakeRepo) -> None:

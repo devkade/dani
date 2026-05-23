@@ -154,6 +154,7 @@ class DaniConfig:
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT_SECONDS
     bot_login: str | None = None
     max_issue_followups: int = DEFAULT_MAX_ISSUE_FOLLOWUPS
+    repo_concurrency: int = 1
 
     @property
     def config_path(self) -> Path:
