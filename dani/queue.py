@@ -13,6 +13,7 @@ JobHandler = Callable[[JobRecord], Any]
 _REPO_WIDE_LOCK_KEY = "repo"
 _REPO_WIDE_STAGES = frozenset({"dev_sync", "final_verdict"})
 _ISOLATION_REQUIRED_STAGES = frozenset({"merge_conflict_resolution"})
+_WORK_LINE_STAGES = frozenset({"implementation", "issue_followup", "review_round"})
 
 
 @dataclass(slots=True)
@@ -175,6 +176,11 @@ def job_lock_key(job: JobRecord) -> str:
     line_id = job.metadata.get("line_id")
     if line_id:
         return f"line:{line_id}"
+    if job.stage in _WORK_LINE_STAGES:
+        if job.pr_number is not None:
+            return f"line:pr-{job.pr_number}"
+        if job.issue_number is not None:
+            return f"line:issue-{job.issue_number}"
     if job.pr_number is not None:
         return f"pr:{job.pr_number}"
     if job.issue_number is not None:

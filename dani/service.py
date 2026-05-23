@@ -2210,11 +2210,17 @@ class DaniService:
         return {"status": "marked_terminal", "pr_number": event.number, "merged": merged}
 
     def _queue_implementation(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
+        line_id = f"issue-{event.number}"
         job = self._enqueue_job(
             repo,
             stage="implementation",
             issue_number=event.number,
-            metadata={"title": event.title or "", "body": event.payload.get("issue", {}).get("body", "")},
+            metadata={
+                "title": event.title or "",
+                "body": event.payload.get("issue", {}).get("body", ""),
+                "line_id": line_id,
+                "issue_id": str(event.number),
+            },
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 

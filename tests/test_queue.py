@@ -133,6 +133,52 @@ def test_same_repo_same_line_id_runs_sequentially() -> None:
     assert events == [("first", "start"), ("first", "end"), ("second", "start"), ("second", "end")]
 
 
+def test_issue_backed_implementation_and_line_review_share_canonical_lock() -> None:
+    events: list[tuple[str, str]] = []
+    lock = threading.Lock()
+    implementation_started = threading.Event()
+    review_started_before_release = threading.Event()
+    release_implementation = threading.Event()
+
+    def handler(job: JobRecord) -> None:
+        with lock:
+            events.append((job.stage, "start"))
+            if job.stage == "implementation":
+                implementation_started.set()
+            elif job.stage == "review_round":
+                review_started_before_release.set()
+        if job.stage == "implementation":
+            assert release_implementation.wait(timeout=2)
+        with lock:
+            events.append((job.stage, "end"))
+
+    manager = RepoQueueManager(handler, repo_concurrency=2)
+    manager.submit(JobRecord(repo_full_name="acme/demo", stage="implementation", issue_number=12))
+    manager.submit(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="review_round",
+            issue_number=12,
+            pr_number=99,
+            metadata={"line_id": "issue-12"},
+        )
+    )
+
+    assert implementation_started.wait(timeout=1)
+    assert not review_started_before_release.wait(timeout=0.15)
+    snapshot = manager.snapshot()["repos"]["acme/demo"]
+    release_implementation.set()
+    manager.join_all()
+
+    assert snapshot["running"][0]["lock_key"] == "line:issue-12"
+    assert events == [
+        ("implementation", "start"),
+        ("implementation", "end"),
+        ("review_round", "start"),
+        ("review_round", "end"),
+    ]
+
+
 def test_repo_wide_locked_stage_blocks_conflicting_line_jobs() -> None:
     events: list[tuple[str, str]] = []
     lock = threading.Lock()
