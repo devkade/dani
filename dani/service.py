@@ -578,21 +578,32 @@ class DaniService:
     def _handle_final_verdict_agent_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         pr_number = int(signature["pr"])
         event_key = self._agent_event_key(signature, default_pr=pr_number)
+        source_job = self.storage.get_job(signature.get("job", ""))
+
+        return self._run_repo_exclusive(
+            event.repo_full_name,
+            lambda: self._complete_final_verdict_transaction(event, source_job, pr_number, event_key, signature),
+        )
+
+    def _complete_final_verdict_transaction(
+        self,
+        event: NormalizedEvent,
+        source_job: JobRecord | None,
+        pr_number: int,
+        event_key: str,
+        signature: dict[str, str],
+    ) -> dict[str, Any]:
         if self.storage.has_processed_event(event_key):
             return {"status": "ignored", "reason": "duplicate_agent_event"}
         if not self._is_pr_open(event.repo_full_name, pr_number):
             return {"status": "ignored", "reason": "pr_not_open"}
-        source_job = self.storage.get_job(signature.get("job", ""))
         pull_request = self.github.get_pull_request(event.repo_full_name, pr_number)
         if not self._pull_request_author_is_repo_owner(event.repo_full_name, pull_request):
             self._update_work_line_state(source_job, auto_merge_state="human_merge_required")
             self.storage.record_processed_event(event_key)
             return {"status": "approved", "reason": "human_merge_required", "pr_number": pr_number}
         try:
-            self._run_repo_exclusive(
-                event.repo_full_name,
-                lambda: self._merge_and_cleanup_final_verdict(event, source_job, pr_number),
-            )
+            self._merge_and_cleanup_final_verdict(event, source_job, pr_number)
         except MergeConflictError as exc:
             self._update_work_line_state(source_job, auto_merge_state="merge_conflict", error=str(exc), retryable=True)
             repo = self.storage.get_repo(event.repo_full_name)
@@ -640,7 +651,6 @@ class DaniService:
             return {"status": "queued", "job_id": merge_conflict_job.id, "stage": merge_conflict_job.stage}
         self.storage.record_processed_event(event_key)
         return {"status": "merged", "pr_number": pr_number}
-
 
     def _run_repo_exclusive(self, repo_full_name: str, callback: Any) -> Any:
         return self.queue_manager.run_exclusive(repo_full_name, callback)

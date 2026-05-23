@@ -3031,6 +3031,67 @@ def test_duplicate_final_verdict_event_is_ignored(tmp_path: Path) -> None:
     assert omx_runner.launches[-1]["job"].pr_number == 77
 
 
+def test_concurrent_duplicate_final_verdict_event_merges_once(tmp_path: Path) -> None:
+    service, github, _omx_runner = make_service(tmp_path)
+    github.add_pull_request(
+        "acme/demo",
+        77,
+        "Implements #5\n<!-- dani:stage=implementation;job=impl-1;issue=5 -->",
+        title="Feature/#5",
+        head_branch="feature/5",
+        base_branch="dev",
+    )
+    event = NormalizedEvent(
+        kind="pull_request_comment",
+        repo_full_name="acme/demo",
+        action="created",
+        number=77,
+        actor_login="agent",
+        payload={},
+        body=build_signature(stage="final_verdict", job="verdict-1", pr=77, verdict="APPROVE"),
+        title="Feature/#5",
+        is_pull_request=True,
+    )
+    original_merge = github.merge_pull_request
+    merge_started = threading.Event()
+    release_merge = threading.Event()
+
+    def blocking_merge(repo_full_name: str, pr_number: int) -> None:
+        merge_started.set()
+        assert release_merge.wait(timeout=5)
+        original_merge(repo_full_name, pr_number)
+
+    github.merge_pull_request = blocking_merge  # type: ignore[assignment]
+    results: list[dict[str, object]] = []
+
+    def handle() -> None:
+        results.append(service.handle_event(event))
+
+    first = threading.Thread(target=handle)
+    second = threading.Thread(target=handle)
+    first.start()
+    assert merge_started.wait(timeout=5)
+    second.start()
+    for _ in range(50):
+        repo_state = service.queue_manager.snapshot()["repos"].get("acme/demo", {})
+        if repo_state.get("exclusive_waiting") == 1:
+            break
+        threading.Event().wait(0.01)
+    else:
+        pytest.fail("second final verdict delivery did not wait for repo-exclusive transaction")
+
+    release_merge.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(results) == 2
+    assert {"status": "merged", "pr_number": 77} in results
+    assert {"status": "ignored", "reason": "duplicate_agent_event"} in results
+    assert github.merged == [("acme/demo", 77)]
+
+
 def test_final_verdict_transient_failure_allows_redelivery(tmp_path: Path) -> None:
     """A transient merge failure must not poison redelivery — the retry must succeed."""
     from github.GithubException import GithubException
