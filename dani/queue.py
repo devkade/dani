@@ -11,7 +11,7 @@ from dani.models import JobRecord
 JobHandler = Callable[[JobRecord], Any]
 
 _REPO_WIDE_LOCK_KEY = "repo"
-_REPO_WIDE_STAGES = frozenset({"dev_sync", "final_verdict"})
+_REPO_WIDE_STAGES = frozenset({"dev_sync", "final_verdict_merge"})
 _ISOLATION_REQUIRED_STAGES = frozenset({"merge_conflict_resolution"})
 _WORK_LINE_STAGES = frozenset({"implementation", "issue_followup", "review_round"})
 
@@ -172,6 +172,12 @@ def job_lock_key(job: JobRecord) -> str:
     if job.stage in _REPO_WIDE_STAGES or job.metadata.get("repo_wide_lock") is True:
         return _REPO_WIDE_LOCK_KEY
     if job.stage in _ISOLATION_REQUIRED_STAGES and not job.metadata.get("worktree_path"):
+        return _REPO_WIDE_LOCK_KEY
+    if (
+        job.stage in _WORK_LINE_STAGES
+        and job.metadata.get("external_contribution") is True
+        and not job.metadata.get("worktree_path")
+    ):
         return _REPO_WIDE_LOCK_KEY
     line_id = job.metadata.get("line_id")
     if line_id:

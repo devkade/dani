@@ -1307,10 +1307,12 @@ def test_final_verdict_updates_only_own_work_line_merge_state(tmp_path: Path) ->
             body=build_signature(stage="final_verdict", job=final_verdict_job.id, pr=101, verdict="APPROVE"),
         )
     )
+    service.wait_for_idle()
 
     first_after = service.storage.get_work_line("acme/demo", "issue-21")
     second_after = service.storage.get_work_line("acme/demo", "issue-22")
-    assert result == {"status": "merged", "pr_number": 101}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert github.merged == [("acme/demo", 101)]
     assert first_after is not None
     assert first_after.status == "merged"
@@ -1476,10 +1478,12 @@ def test_review_fix_loop_repeats_in_same_work_line_until_final_approval(tmp_path
             body=build_signature(stage="final_verdict", job=verdict_job.id, pr=101, verdict="APPROVE"),
         )
     )
+    service.wait_for_idle()
 
     work_line = service.storage.get_work_line("acme/demo", "issue-11")
     line_job_ids = [launch["job"].id for launch in omx_runner.launches]
-    assert result == {"status": "merged", "pr_number": 101}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert github.merged == [("acme/demo", 101)]
     assert [
         job.review_round for job in service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round")
@@ -2447,7 +2451,8 @@ def test_external_final_verdict_approve_requires_human_merge_for_non_owner_pr(tm
     )
     service.wait_for_idle()
 
-    assert result == {"status": "approved", "reason": "human_merge_required", "pr_number": 88}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=88) == []
     assert omx_runner.launches == []
     assert github.merged == []
@@ -2675,8 +2680,10 @@ def test_review_chain_reaches_verdict_and_merges_on_approve(tmp_path: Path) -> N
         is_pull_request=True,
     )
     result = service.handle_event(verdict_event)
+    service.wait_for_idle()
 
-    assert result == {"status": "merged", "pr_number": 77}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert github.merged == [("acme/demo", 77)]
 
 
@@ -2710,7 +2717,7 @@ def test_approve_verdict_with_merge_conflict_queues_resolution_job(tmp_path: Pat
     resolution_jobs = service.storage.find_jobs(
         repo_full_name="acme/demo", stage="merge_conflict_resolution", pr_number=77
     )
-    assert result["stage"] == "merge_conflict_resolution"
+    assert result["stage"] == "final_verdict_merge"
     assert resolution_jobs
     assert resolution_jobs[0].issue_number == 5
     assert resolution_jobs[0].metadata["head_branch"] == "Feature/#5"
@@ -2760,7 +2767,7 @@ def test_approve_verdict_with_merge_conflict_reuses_tracked_issue_number_without
     resolution_jobs = service.storage.find_jobs(
         repo_full_name="acme/demo", stage="merge_conflict_resolution", pr_number=77
     )
-    assert result["stage"] == "merge_conflict_resolution"
+    assert result["stage"] == "final_verdict_merge"
     assert resolution_jobs[0].issue_number == 5
     assert resolution_jobs[0].metadata["head_branch"] == "feature/no-issue"
 
@@ -3031,6 +3038,68 @@ def test_duplicate_final_verdict_event_is_ignored(tmp_path: Path) -> None:
     assert omx_runner.launches[-1]["job"].pr_number == 77
 
 
+def test_final_verdict_event_enqueues_merge_job_without_waiting_for_running_repo_job(tmp_path: Path) -> None:
+    service, github, _omx_runner = make_service(tmp_path)
+    github.add_pull_request(
+        "acme/demo",
+        77,
+        "Implements #5\n<!-- dani:stage=implementation;job=impl-1;issue=5 -->",
+        title="Feature/#5",
+        head_branch="feature/5",
+        base_branch="dev",
+    )
+    running_started = threading.Event()
+    release_running = threading.Event()
+    original_run_job = service._run_job
+
+    def run_job(job: JobRecord) -> None:
+        if job.id == "line-job":
+            running_started.set()
+            assert release_running.wait(timeout=5)
+            return
+        original_run_job(job)
+
+    service.queue_manager._handler = run_job
+    service.queue_manager.submit(
+        JobRecord(
+            id="line-job",
+            repo_full_name="acme/demo",
+            stage="implementation",
+            issue_number=99,
+            metadata={"line_id": "issue-99", "worktree_path": str(tmp_path / "wt-99")},
+        )
+    )
+    for scheduler in service.queue_manager._schedulers.values():
+        scheduler.handler = run_job
+
+    assert running_started.wait(timeout=1)
+    event = NormalizedEvent(
+        kind="pull_request_comment",
+        repo_full_name="acme/demo",
+        action="created",
+        number=77,
+        actor_login="agent",
+        payload={},
+        body=build_signature(stage="final_verdict", job="verdict-1", pr=77, verdict="APPROVE"),
+        title="Feature/#5",
+        is_pull_request=True,
+    )
+
+    result = service.handle_event(event)
+
+    merge_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict_merge", pr_number=77)
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
+    assert len(merge_jobs) == 1
+    assert github.merged == []
+
+    release_running.set()
+    service.wait_for_idle()
+
+    assert github.merged == [("acme/demo", 77)]
+    assert service.storage.has_processed_event(str(merge_jobs[0].metadata["event_key"]))
+
+
 def test_concurrent_duplicate_final_verdict_event_merges_once(tmp_path: Path) -> None:
     service, github, _omx_runner = make_service(tmp_path)
     github.add_pull_request(
@@ -3072,28 +3141,24 @@ def test_concurrent_duplicate_final_verdict_event_merges_once(tmp_path: Path) ->
     first.start()
     assert merge_started.wait(timeout=5)
     second.start()
-    for _ in range(50):
-        repo_state = service.queue_manager.snapshot()["repos"].get("acme/demo", {})
-        if repo_state.get("exclusive_waiting") == 1:
-            break
-        threading.Event().wait(0.01)
-    else:
-        pytest.fail("second final verdict delivery did not wait for repo-exclusive transaction")
 
     release_merge.set()
     first.join(timeout=5)
     second.join(timeout=5)
+    service.wait_for_idle()
 
     assert not first.is_alive()
     assert not second.is_alive()
     assert len(results) == 2
-    assert {"status": "merged", "pr_number": 77} in results
-    assert {"status": "ignored", "reason": "duplicate_agent_event"} in results
+    assert any(result["status"] == "queued" and result["stage"] == "final_verdict_merge" for result in results)
+    assert any(result["status"] == "ignored" and result["reason"] == "duplicate_agent_event" for result in results)
     assert github.merged == [("acme/demo", 77)]
 
 
-def test_final_verdict_transient_failure_allows_redelivery(tmp_path: Path) -> None:
-    """A transient merge failure must not poison redelivery — the retry must succeed."""
+def test_final_verdict_transient_failure_retries_queued_merge_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient merge failure after webhook acceptance must retry inside the queued job."""
     from github.GithubException import GithubException
 
     service, github, _omx_runner = make_service(tmp_path)
@@ -3116,11 +3181,17 @@ def test_final_verdict_transient_failure_allows_redelivery(tmp_path: Path) -> No
         base_branch="dev",
     )
     original_merge = github.merge_pull_request
+    attempts = 0
 
-    def boom(repo_full_name: str, pr_number: int) -> None:
-        raise GithubException(500, {"message": "GitHub outage"}, {})
+    def boom_once(repo_full_name: str, pr_number: int) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise GithubException(500, {"message": "GitHub outage"}, {})
+        original_merge(repo_full_name, pr_number)
 
-    github.merge_pull_request = boom  # type: ignore[assignment]
+    monkeypatch.setattr("dani.service.RETRY_BACKOFF_SECONDS", [0])
+    github.merge_pull_request = boom_once  # type: ignore[assignment]
     event = NormalizedEvent(
         kind="pull_request_comment",
         repo_full_name="acme/demo",
@@ -3133,13 +3204,16 @@ def test_final_verdict_transient_failure_allows_redelivery(tmp_path: Path) -> No
         is_pull_request=True,
     )
 
-    with pytest.raises(GithubException):
-        service.handle_event(event)
-
-    # Restore normal merge and redeliver the same event
-    github.merge_pull_request = original_merge  # type: ignore[assignment]
     result = service.handle_event(event)
-    assert result["status"] == "merged"
+    service.wait_for_idle()
+
+    merge_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict_merge", pr_number=77)
+    completed_job = merge_jobs[-1]
+    assert result["status"] == "queued"
+    assert attempts == 2
+    assert completed_job.status == "completed"
+    assert completed_job.metadata["retry_attempts"] == 1
+    assert service.storage.has_processed_event(str(completed_job.metadata["event_key"]))
     assert ("acme/demo", 77) in github.merged
 
 
@@ -3201,9 +3275,11 @@ def test_final_verdict_cleans_worktree_and_local_branch_after_successful_merge(t
             body=build_signature(stage="final_verdict", job=job.id, pr=101, verdict="APPROVE"),
         )
     )
+    service.wait_for_idle()
 
     work_line = service.storage.get_work_line("acme/demo", "issue-11")
-    assert result == {"status": "merged", "pr_number": 101}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert merge_seen == [("acme/demo", "feature/#11")]
     assert github.merged == [("acme/demo", 101)]
     assert not worktree_path.exists()
@@ -3279,10 +3355,12 @@ def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed
             body=build_signature(stage="final_verdict", job=job.id, pr=102, verdict="APPROVE"),
         )
     )
+    assert submitted_jobs and submitted_jobs[0].stage == "final_verdict_merge"
+    service._run_job(submitted_jobs[0])
 
     work_line = service.storage.get_work_line("acme/demo", "issue-12")
     assert result["status"] == "queued"
-    assert result["stage"] == "merge_conflict_resolution"
+    assert result["stage"] == "final_verdict_merge"
     assert github.merged == []
     assert worktree_path.is_dir()
     assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#12").returncode == 0
@@ -3299,7 +3377,7 @@ def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed
         repo_full_name="acme/demo", stage="merge_conflict_resolution", pr_number=102
     )
     assert len(resolution_jobs) == 1
-    assert [submitted_job.id for submitted_job in submitted_jobs] == [resolution_jobs[0].id]
+    assert [submitted_job.id for submitted_job in submitted_jobs] == [result["job_id"], resolution_jobs[0].id]
     assert resolution_jobs[0].metadata["conflict_reason"] == "merge conflict with base branch"
     assert resolution_jobs[0].metadata["line_id"] == ownership_metadata["line_id"]
     assert resolution_jobs[0].metadata["branch_name"] == ownership_metadata["branch_name"]
@@ -3329,8 +3407,11 @@ def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed
             body=build_signature(stage="final_verdict", job=retry_job.id, pr=102, verdict="APPROVE"),
         )
     )
+    assert submitted_jobs[-1].stage == "final_verdict_merge"
+    service._run_job(submitted_jobs[-1])
     work_line = service.storage.get_work_line("acme/demo", "issue-12")
-    assert merged_result == {"status": "merged", "pr_number": 102}
+    assert merged_result["status"] == "queued"
+    assert merged_result["stage"] == "final_verdict_merge"
     assert github.merged == [("acme/demo", 102)]
     assert not worktree_path.exists()
     assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#12", check=False).returncode != 0
@@ -3390,11 +3471,13 @@ def test_final_verdict_records_cleanup_failure_without_rolling_back_merge(
             body=build_signature(stage="final_verdict", job=job.id, pr=103, verdict="APPROVE"),
         )
     )
+    service.wait_for_idle()
 
     work_line = service.storage.get_work_line("acme/demo", "issue-13")
     updated_job = service.storage.get_job(job.id)
     snapshot_work_lines = {line["line_id"]: line for line in service.state_snapshot()["work_lines"]["work_lines"]}
-    assert result == {"status": "merged", "pr_number": 103}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert github.merged == [("acme/demo", 103)]
     assert (tmp_path / ".dani-runs" / "worktrees" / "acme-demo" / "issue-13").is_dir()
     assert _git(repo_path, "rev-parse", "--verify", "refs/heads/feature/#13").returncode == 0
@@ -3456,10 +3539,12 @@ def test_final_verdict_refuses_to_cleanup_protected_branch(tmp_path: Path) -> No
             body=build_signature(stage="final_verdict", job=job.id, pr=104, verdict="APPROVE"),
         )
     )
+    service.wait_for_idle()
 
     work_line = service.storage.get_work_line("acme/demo", "issue-14")
     updated_job = service.storage.get_job(job.id)
-    assert result == {"status": "merged", "pr_number": 104}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert work_line is not None
     assert work_line.cleanup_state == "cleanup_failed"
     assert work_line.cleanup_error == "refusing to delete protected branch: dev"
@@ -3504,10 +3589,12 @@ def test_final_verdict_refuses_to_cleanup_unmanaged_worktree_path(tmp_path: Path
             body=build_signature(stage="final_verdict", job=job.id, pr=105, verdict="APPROVE"),
         )
     )
+    service.wait_for_idle()
 
     work_line = service.storage.get_work_line("acme/demo", "issue-15")
     updated_job = service.storage.get_job(job.id)
-    assert result == {"status": "merged", "pr_number": 105}
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert work_line is not None
     assert work_line.cleanup_state == "cleanup_failed"
     assert work_line.cleanup_error == f"refusing to clean unmanaged worktree path: {unmanaged_worktree}"
@@ -3956,9 +4043,10 @@ def test_final_verdict_stops_when_pr_is_closed(tmp_path: Path) -> None:
         is_pull_request=True,
     )
     result = service.handle_event(verdict_event)
+    service.wait_for_idle()
 
-    assert result["status"] == "ignored"
-    assert result["reason"] == "pr_not_open"
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict_merge"
     assert github.merged == []
 
 

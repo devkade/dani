@@ -4,6 +4,7 @@ import contextlib
 import logging
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,6 +63,7 @@ MAX_COMMENT_RECOVERY_ATTEMPTS = 1
 RETRY_BACKOFF_SECONDS: list[int] = [60, 180, 600]
 
 logger = logging.getLogger(__name__)
+FINAL_VERDICT_MERGE_STAGE = "final_verdict_merge"
 
 
 class DaniService:
@@ -87,6 +89,7 @@ class DaniService:
         self.dev_syncer = dev_syncer or GitDevSyncer(config.run_dir)
         self.work_line_manager = work_line_manager or GitWorkLineManager(config.run_dir)
         self.session_bridge = session_bridge or OmoSessionBridge()
+        self._final_verdict_enqueue_lock = threading.RLock()
         self.queue_manager = RepoQueueManager(self._run_job, repo_concurrency=config.repo_concurrency)
         self._rehydrate_pending_jobs()
 
@@ -579,11 +582,88 @@ class DaniService:
         pr_number = int(signature["pr"])
         event_key = self._agent_event_key(signature, default_pr=pr_number)
         source_job = self.storage.get_job(signature.get("job", ""))
+        repo = self.storage.get_repo(event.repo_full_name)
+        if repo is None:
+            return {"status": "ignored", "reason": "missing_repo"}
+        with self._final_verdict_enqueue_lock:
+            if self.storage.has_processed_event(event_key):
+                return {"status": "ignored", "reason": "duplicate_agent_event"}
+            existing = self._active_final_verdict_merge_job(event.repo_full_name, event_key)
+            if existing is not None:
+                return {"status": "ignored", "reason": "duplicate_agent_event", "job_id": existing.id}
+            metadata = self._final_verdict_merge_metadata(event, source_job, pr_number, event_key, signature)
+            job = self._enqueue_job(
+                repo,
+                stage=FINAL_VERDICT_MERGE_STAGE,
+                issue_number=self._issue_number_for_signature_event(
+                    event.repo_full_name, signature, pr_number=pr_number
+                ),
+                pr_number=pr_number,
+                metadata=metadata,
+            )
+        return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
-        return self._run_repo_exclusive(
-            event.repo_full_name,
-            lambda: self._complete_final_verdict_transaction(event, source_job, pr_number, event_key, signature),
-        )
+    def _active_final_verdict_merge_job(self, repo_full_name: str, event_key: str) -> JobRecord | None:
+        for job in self.storage.find_jobs(repo_full_name=repo_full_name, stage=FINAL_VERDICT_MERGE_STAGE):
+            if job.metadata.get("event_key") == event_key and job.status in {
+                "queued",
+                "launched",
+                "retrying",
+                "running",
+            }:
+                return job
+        return None
+
+    def _final_verdict_merge_metadata(
+        self,
+        event: NormalizedEvent,
+        source_job: JobRecord | None,
+        pr_number: int,
+        event_key: str,
+        signature: dict[str, str],
+    ) -> dict[str, Any]:
+        metadata = self._automation_lineage_metadata(source_job)
+        return {
+            **metadata,
+            "repo_wide_lock": True,
+            "event_key": event_key,
+            "source_job_id": source_job.id if source_job is not None else signature.get("job", ""),
+            "signature": dict(signature),
+            "event": {
+                "kind": event.kind,
+                "repo_full_name": event.repo_full_name,
+                "action": event.action,
+                "number": event.number,
+                "actor_login": event.actor_login,
+                "payload": event.payload,
+                "body": event.body,
+                "title": event.title,
+                "base_branch": event.base_branch,
+                "head_branch": event.head_branch,
+                "delivery_id": event.delivery_id,
+                "ref": event.ref,
+                "commit_sha": event.commit_sha,
+                "is_pull_request": event.is_pull_request,
+                "issue_state": event.issue_state,
+                "pr_state": event.pr_state,
+                "pr_merged": event.pr_merged,
+                "actor_type": event.actor_type,
+            },
+            "title": event.title or metadata.get("title", ""),
+            "pr_id": str(pr_number),
+        }
+
+    def _run_final_verdict_merge_job(self, job: JobRecord) -> None:
+        event_payload = job.metadata.get("event")
+        signature = job.metadata.get("signature")
+        event_key = str(job.metadata.get("event_key") or "")
+        if not isinstance(event_payload, dict) or not isinstance(signature, dict) or not event_key:
+            msg = "invalid_final_verdict_merge_job_metadata"
+            raise RuntimeError(msg)
+        event = NormalizedEvent(**event_payload)
+        source_job = self.storage.get_job(str(job.metadata.get("source_job_id") or ""))
+        pr_number = int(job.pr_number or signature["pr"])
+        self._complete_final_verdict_transaction(event, source_job, pr_number, event_key, signature)
 
     def _complete_final_verdict_transaction(
         self,
@@ -734,8 +814,7 @@ class DaniService:
             job.status = "failed"
             return
 
-        if job.stage == "dev_sync":
-            self._run_dev_sync_job(repo, job)
+        if self._run_special_job(repo, job):
             return
 
         retry_history: list[dict[str, str]] = list(job.metadata.get("retry_history", []))
@@ -754,6 +833,59 @@ class DaniService:
                 return
             else:
                 self._handle_job_success(job, attempt, retry_history)
+                return
+
+    def _run_special_job(self, repo: RepoConfig, job: JobRecord) -> bool:
+        if job.stage == "dev_sync":
+            self._run_dev_sync_job(repo, job)
+            return True
+        if job.stage == FINAL_VERDICT_MERGE_STAGE:
+            self._handle_final_verdict_merge_job(job)
+            return True
+        return False
+
+    def _handle_final_verdict_merge_job(self, job: JobRecord) -> None:
+        self.storage.update_job(job.id, status="running")
+        job.status = "running"
+        retry_history: list[dict[str, str]] = list(job.metadata.get("retry_history", []))
+        max_attempts = len(RETRY_BACKOFF_SECONDS) + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._run_final_verdict_merge_job(job)
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    self.storage.update_job(
+                        job.id,
+                        status="failed",
+                        metadata={
+                            **job.metadata,
+                            "error": str(exc),
+                            "retry_attempts": attempt - 1,
+                            "retry_history": retry_history,
+                        },
+                    )
+                    job.status = "failed"
+                    raise
+                retry_history.append({"attempt": str(attempt), "reason": str(exc), "at": utc_now()})
+                self.storage.update_job(
+                    job.id,
+                    status="retrying",
+                    metadata={**job.metadata, "retry_attempts": attempt, "retry_history": retry_history},
+                )
+                time.sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+                self.storage.update_job(job.id, status="running")
+            else:
+                self.storage.update_job(
+                    job.id,
+                    status="completed",
+                    metadata={
+                        **job.metadata,
+                        "completed_at": utc_now(),
+                        "retry_attempts": attempt - 1,
+                        "retry_history": retry_history,
+                    },
+                )
+                job.status = "completed"
                 return
 
     def _handle_job_success(self, job: JobRecord, attempt: int, retry_history: list[dict[str, str]]) -> None:
@@ -2211,18 +2343,50 @@ class DaniService:
 
     def _queue_implementation(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
         line_id = f"issue-{event.number}"
+        metadata = {
+            "title": event.title or "",
+            "body": event.payload.get("issue", {}).get("body", ""),
+            "line_id": line_id,
+            "issue_id": str(event.number),
+        }
+        metadata = self._planned_work_line_metadata(
+            repo,
+            stage="implementation",
+            issue_number=event.number,
+            pr_number=None,
+            metadata=metadata,
+        )
         job = self._enqueue_job(
             repo,
             stage="implementation",
             issue_number=event.number,
-            metadata={
-                "title": event.title or "",
-                "body": event.payload.get("issue", {}).get("body", ""),
-                "line_id": line_id,
-                "issue_id": str(event.number),
-            },
+            metadata=metadata,
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
+
+    def _planned_work_line_metadata(
+        self,
+        repo: RepoConfig,
+        *,
+        stage: str,
+        issue_number: int | None,
+        pr_number: int | None,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        planner = getattr(self.work_line_manager, "planned_metadata", None)
+        if not callable(planner):
+            return metadata
+        planned = planner(
+            repo,
+            JobRecord(
+                repo_full_name=repo.full_name,
+                stage=stage,
+                issue_number=issue_number,
+                pr_number=pr_number,
+                metadata=metadata,
+            ),
+        )
+        return {**planned, **metadata}
 
     def _ensure_work_line(self, repo: RepoConfig, job: JobRecord) -> None:
         context = self.work_line_manager.prepare(repo, job)
@@ -2230,7 +2394,9 @@ class DaniService:
         existing = self.storage.get_work_line(repo.full_name, context.line_id)
         existing_agent_run_ids = list(existing.agent_run_ids) if existing is not None else []
         raw_agent_run_ids = metadata.get("agent_run_ids")
-        metadata_agent_run_ids = [str(item) for item in raw_agent_run_ids] if isinstance(raw_agent_run_ids, list) else []
+        metadata_agent_run_ids = (
+            [str(item) for item in raw_agent_run_ids] if isinstance(raw_agent_run_ids, list) else []
+        )
         agent_run_ids = existing_agent_run_ids[:]
         for agent_run_id in metadata_agent_run_ids:
             if agent_run_id not in agent_run_ids:

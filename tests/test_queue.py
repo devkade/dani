@@ -122,8 +122,20 @@ def test_same_repo_same_line_id_runs_sequentially() -> None:
         assert line_id == "issue-1"
 
     manager = RepoQueueManager(handler, repo_concurrency=2)
-    manager.submit(JobRecord(id="first", repo_full_name="acme/demo", stage="review_round", pr_number=10, metadata={"line_id": "issue-1"}))
-    manager.submit(JobRecord(id="second", repo_full_name="acme/demo", stage="implementation", pr_number=10, metadata={"line_id": "issue-1"}))
+    manager.submit(
+        JobRecord(
+            id="first", repo_full_name="acme/demo", stage="review_round", pr_number=10, metadata={"line_id": "issue-1"}
+        )
+    )
+    manager.submit(
+        JobRecord(
+            id="second",
+            repo_full_name="acme/demo",
+            stage="implementation",
+            pr_number=10,
+            metadata={"line_id": "issue-1"},
+        )
+    )
 
     assert first_started.wait(timeout=1)
     assert not second_started_before_release.wait(timeout=0.15)
@@ -200,14 +212,21 @@ def test_repo_wide_locked_stage_blocks_conflicting_line_jobs() -> None:
 
     manager = RepoQueueManager(handler, repo_concurrency=2)
     manager.submit(JobRecord(repo_full_name="acme/demo", stage="dev_sync", metadata={"main_sha": "abc"}))
-    manager.submit(JobRecord(repo_full_name="acme/demo", stage="implementation", issue_number=1, metadata={"line_id": "issue-1"}))
+    manager.submit(
+        JobRecord(repo_full_name="acme/demo", stage="implementation", issue_number=1, metadata={"line_id": "issue-1"})
+    )
 
     assert dev_sync_started.wait(timeout=1)
     assert not implementation_started_before_release.wait(timeout=0.15)
     release_dev_sync.set()
     manager.join_all()
 
-    assert events == [("dev_sync", "start"), ("dev_sync", "end"), ("implementation", "start"), ("implementation", "end")]
+    assert events == [
+        ("dev_sync", "start"),
+        ("dev_sync", "end"),
+        ("implementation", "start"),
+        ("implementation", "end"),
+    ]
 
 
 def test_pending_repo_wide_stage_is_a_barrier_for_later_line_jobs() -> None:
@@ -308,6 +327,55 @@ def test_merge_conflict_resolution_without_worktree_uses_repo_wide_lock() -> Non
     assert events == [("first", "start"), ("first", "end"), ("second", "start"), ("second", "end")]
 
 
+def test_shared_checkout_external_pr_reviews_use_repo_wide_lock() -> None:
+    events: list[tuple[str, str]] = []
+    lock = threading.Lock()
+    first_started = threading.Event()
+    second_started_before_release = threading.Event()
+    release_first = threading.Event()
+
+    def handler(job: JobRecord) -> None:
+        with lock:
+            events.append((job.id, "start"))
+            if job.id == "pr-1":
+                first_started.set()
+            elif job.id == "pr-2":
+                second_started_before_release.set()
+        if job.id == "pr-1":
+            assert release_first.wait(timeout=2)
+        with lock:
+            events.append((job.id, "end"))
+
+    manager = RepoQueueManager(handler, repo_concurrency=2)
+    manager.submit(
+        JobRecord(
+            id="pr-1",
+            repo_full_name="acme/demo",
+            stage="review_round",
+            pr_number=1,
+            metadata={"external_contribution": True},
+        )
+    )
+    manager.submit(
+        JobRecord(
+            id="pr-2",
+            repo_full_name="acme/demo",
+            stage="review_round",
+            pr_number=2,
+            metadata={"external_contribution": True},
+        )
+    )
+
+    assert first_started.wait(timeout=1)
+    assert not second_started_before_release.wait(timeout=0.15)
+    snapshot = manager.snapshot()["repos"]["acme/demo"]
+    release_first.set()
+    manager.join_all()
+
+    assert snapshot["running"][0]["lock_key"] == "repo"
+    assert events == [("pr-1", "start"), ("pr-1", "end"), ("pr-2", "start"), ("pr-2", "end")]
+
+
 def test_run_exclusive_waits_for_running_jobs_and_blocks_later_dispatch() -> None:
     events: list[str] = []
     lock = threading.Lock()
@@ -331,17 +399,26 @@ def test_run_exclusive_waits_for_running_jobs_and_blocks_later_dispatch() -> Non
         record(f"{job.id}:end")
 
     manager = RepoQueueManager(handler, repo_concurrency=2)
-    manager.submit(JobRecord(id="first", repo_full_name="acme/demo", stage="implementation", metadata={"line_id": "issue-1"}))
+    manager.submit(
+        JobRecord(id="first", repo_full_name="acme/demo", stage="implementation", metadata={"line_id": "issue-1"})
+    )
     assert first_started.wait(timeout=1)
 
     exclusive_thread = threading.Thread(
         target=lambda: manager.run_exclusive(
             "acme/demo",
-            lambda: (record("exclusive:start"), exclusive_started.set(), release_exclusive.wait(timeout=2), record("exclusive:end")),
+            lambda: (
+                record("exclusive:start"),
+                exclusive_started.set(),
+                release_exclusive.wait(timeout=2),
+                record("exclusive:end"),
+            ),
         )
     )
     exclusive_thread.start()
-    manager.submit(JobRecord(id="second", repo_full_name="acme/demo", stage="implementation", metadata={"line_id": "issue-2"}))
+    manager.submit(
+        JobRecord(id="second", repo_full_name="acme/demo", stage="implementation", metadata={"line_id": "issue-2"})
+    )
 
     assert not exclusive_started.wait(timeout=0.15)
     assert not second_started_before_exclusive.wait(timeout=0.15)
