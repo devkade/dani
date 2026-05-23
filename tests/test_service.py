@@ -3133,6 +3133,10 @@ def test_final_verdict_preserves_worktree_and_branch_when_merge_does_not_succeed
         def join_all(self) -> None:
             return None
 
+        def run_exclusive(self, repo_full_name: str, callback):
+            assert repo_full_name == "acme/demo"
+            return callback()
+
     service.queue_manager = CapturingQueue()
     service.register_repo("acme/demo", str(repo_path))
     repo = service.storage.get_repo("acme/demo")

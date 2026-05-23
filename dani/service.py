@@ -87,7 +87,7 @@ class DaniService:
         self.dev_syncer = dev_syncer or GitDevSyncer(config.run_dir)
         self.work_line_manager = work_line_manager or GitWorkLineManager(config.run_dir)
         self.session_bridge = session_bridge or OmoSessionBridge()
-        self.queue_manager = RepoQueueManager(self._run_job)
+        self.queue_manager = RepoQueueManager(self._run_job, repo_concurrency=config.repo_concurrency)
         self._rehydrate_pending_jobs()
 
     def _rehydrate_pending_jobs(self) -> None:
@@ -226,7 +226,9 @@ class DaniService:
         self.queue_manager.join_all()
 
     def state_snapshot(self) -> dict[str, Any]:
-        return self.storage.snapshot()
+        snapshot = self.storage.snapshot()
+        snapshot["queue"] = self.queue_manager.snapshot()
+        return snapshot
 
     def restart_issue(self, repo_full_name: str, issue_number: int) -> JobRecord:
         repo = self.storage.get_repo(repo_full_name)
@@ -249,7 +251,7 @@ class DaniService:
             },
         )
 
-    def handle_event(self, event: NormalizedEvent) -> dict[str, Any]:
+    def handle_event(self, event: NormalizedEvent) -> dict[str, Any]:  # noqa: C901
         self.storage.append_event({
             "repo_full_name": event.repo_full_name,
             "kind": event.kind,
@@ -587,8 +589,10 @@ class DaniService:
             self.storage.record_processed_event(event_key)
             return {"status": "approved", "reason": "human_merge_required", "pr_number": pr_number}
         try:
-            self._update_work_line_state(source_job, auto_merge_state="merging")
-            self.github.merge_pull_request(event.repo_full_name, pr_number)
+            self._run_repo_exclusive(
+                event.repo_full_name,
+                lambda: self._merge_and_cleanup_final_verdict(event, source_job, pr_number),
+            )
         except MergeConflictError as exc:
             self._update_work_line_state(source_job, auto_merge_state="merge_conflict", error=str(exc), retryable=True)
             repo = self.storage.get_repo(event.repo_full_name)
@@ -635,9 +639,19 @@ class DaniService:
             self.storage.record_processed_event(event_key)
             return {"status": "queued", "job_id": merge_conflict_job.id, "stage": merge_conflict_job.stage}
         self.storage.record_processed_event(event_key)
+        return {"status": "merged", "pr_number": pr_number}
+
+
+    def _run_repo_exclusive(self, repo_full_name: str, callback: Any) -> Any:
+        return self.queue_manager.run_exclusive(repo_full_name, callback)
+
+    def _merge_and_cleanup_final_verdict(
+        self, event: NormalizedEvent, source_job: JobRecord | None, pr_number: int
+    ) -> None:
+        self._update_work_line_state(source_job, auto_merge_state="merging")
+        self.github.merge_pull_request(event.repo_full_name, pr_number)
         self._update_work_line_state(source_job, status="merged", auto_merge_state="merged", retryable=False)
         self._cleanup_work_line_after_merge(source_job)
-        return {"status": "merged", "pr_number": pr_number}
 
     def _handle_review_round_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         event_key = self._agent_event_key(signature, default_pr=event.number if event.is_pull_request else None)

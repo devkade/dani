@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import dani.cli as cli_module
@@ -160,3 +161,45 @@ def test_build_config_reads_max_issue_followups_from_config_file(tmp_path: Path,
     config = cli_module.build_config(data_dir)
 
     assert config.max_issue_followups == 7
+
+
+def test_build_config_reads_repo_concurrency_from_env(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    monkeypatch.setenv("DANI_REPO_CONCURRENCY", "4")
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.repo_concurrency == 4
+
+
+def test_build_config_reads_repo_concurrency_from_config_file(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"repo_concurrency": 3}), encoding="utf-8")
+    monkeypatch.delenv("DANI_REPO_CONCURRENCY", raising=False)
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.repo_concurrency == 3
+
+
+def test_build_config_accepts_max_repo_workers_alias_from_config_file(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"max_repo_workers": 5}), encoding="utf-8")
+    monkeypatch.delenv("DANI_REPO_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DANI_MAX_REPO_WORKERS", raising=False)
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.repo_concurrency == 5
+
+
+def test_build_config_rejects_zero_repo_concurrency(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    monkeypatch.setenv("DANI_REPO_CONCURRENCY", "0")
+
+    with pytest.raises(cli_module.typer.BadParameter):
+        cli_module.build_config(data_dir)
