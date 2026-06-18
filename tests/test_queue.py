@@ -36,6 +36,26 @@ def test_queue_is_serial_per_repo_and_parallel_across_repos() -> None:
     assert repo_b_start < repo_a_ends[0]
 
 
+def test_queue_snapshot_includes_role_metadata() -> None:
+    release = threading.Event()
+    started = threading.Event()
+
+    def handler(job: JobRecord) -> None:
+        started.set()
+        assert release.wait(timeout=2)
+
+    manager = RepoQueueManager(handler, repo_concurrency=1)
+    manager.submit(JobRecord(repo_full_name="acme/demo", stage="issue_request", role="reviewer", issue_number=1))
+    assert started.wait(timeout=2)
+
+    snapshot = manager.snapshot()
+    running = snapshot["repos"]["acme/demo"]["running"][0]
+    assert running["role"] == "reviewer"
+
+    release.set()
+    manager.join_all()
+
+
 def test_repo_queue_concurrency_one_runs_jobs_fifo_across_issues() -> None:
     handled: list[tuple[str, int | None]] = []
 

@@ -5,6 +5,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
+from typing import Any, cast
 
 import typer
 import uvicorn
@@ -130,6 +131,10 @@ def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> D
     bot_login = _resolve_bot_login(config_payload)
     max_issue_followups = _resolve_max_issue_followups(config_payload)
     repo_concurrency = _resolve_repo_concurrency(config_payload)
+    role_bindings = config_payload.get("role_bindings", {})
+    if not isinstance(role_bindings, dict):
+        role_bindings = {}
+    typed_role_bindings = cast(dict[str, Any], role_bindings)
     return DaniConfig(
         data_dir=data_dir,
         webhook_secret=secret,
@@ -140,6 +145,7 @@ def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> D
         bot_login=bot_login,
         max_issue_followups=max_issue_followups,
         repo_concurrency=repo_concurrency,
+        role_bindings=typed_role_bindings,
     )
 
 

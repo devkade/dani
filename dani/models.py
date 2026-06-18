@@ -40,6 +40,7 @@ class RepoConfig:
 class JobRecord:
     repo_full_name: str
     stage: str
+    role: str | None = None
     issue_number: int | None = None
     pr_number: int | None = None
     review_round: int | None = None
@@ -63,6 +64,7 @@ class SessionRecord:
     script_path: str
     worktree_path: str
     job_id: str
+    role: str | None = None
     issue_number: int | None = None
     pr_number: int | None = None
     review_round: int | None = None
@@ -151,6 +153,7 @@ class DaniConfig:
     port: int = 8787
     review_rounds: int = 3
     agent_runtime: str = "omx"
+    role_bindings: dict[str, Any] = field(default_factory=dict)
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT_SECONDS
     bot_login: str | None = None
     max_issue_followups: int = DEFAULT_MAX_ISSUE_FOLLOWUPS

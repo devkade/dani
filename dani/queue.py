@@ -155,6 +155,7 @@ class _RepoScheduler:
         snapshot = {
             "id": job.id,
             "stage": job.stage,
+            "role": job.role,
             "status": job.status,
             "issue_number": job.issue_number,
             "pr_number": job.pr_number,

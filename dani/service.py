@@ -34,6 +34,13 @@ from dani.models import (
 )
 from dani.prompts import NON_INTERACTIVE_GUARD, ensure_non_interactive_guard, render_prompt, split_non_interactive_guard
 from dani.queue import RepoQueueManager
+from dani.routing import (
+    AgentRoleBinding,
+    default_forbidden_actions,
+    default_role_for_stage,
+    parse_role_bindings,
+    route_event,
+)
 from dani.session_bridge import BridgeContext, OmoSessionBridge
 from dani.signatures import build_signature, is_opt_out_comment, parse_signature
 from dani.storage import JsonStorage
@@ -86,6 +93,7 @@ class DaniService:
         self._runtime_runners: dict[str, AgentRunner] = {preferred_runtime: self.omx_runner}
         if runtime_runners:
             self._runtime_runners.update({normalize_runtime(name): runner for name, runner in runtime_runners.items()})
+        self.role_bindings = parse_role_bindings(config.role_bindings, agent_runtime=config.agent_runtime)
         self.dev_syncer = dev_syncer or GitDevSyncer(config.run_dir)
         self.work_line_manager = work_line_manager or GitWorkLineManager(config.run_dir)
         self.session_bridge = session_bridge or OmoSessionBridge()
@@ -789,14 +797,21 @@ class DaniService:
         pr_number: int | None = None,
         review_round: int | None = None,
         metadata: dict[str, Any] | None = None,
+        role: str | None = None,
+        route_reason: str | None = None,
+        target_metadata: dict[str, Any] | None = None,
     ) -> JobRecord:
+        resolved_role = role or default_role_for_stage(stage)
+        binding = self._role_binding(resolved_role)
+        role_metadata = self._job_role_metadata(binding, route_reason=route_reason, target_metadata=target_metadata)
         job = JobRecord(
             repo_full_name=repo.full_name,
             stage=stage,
+            role=resolved_role,
             issue_number=issue_number,
             pr_number=pr_number,
             review_round=review_round,
-            metadata=metadata or {},
+            metadata={**(metadata or {}), **role_metadata},
         )
         self.storage.create_job(job)
         self.queue_manager.submit(job)
@@ -1182,11 +1197,77 @@ class DaniService:
             self._runtime_runners[normalized] = runner
         return runner
 
+    def _route_kwargs(self, event: NormalizedEvent, *, is_approve_comment: bool = False) -> dict[str, Any]:
+        decision = route_event(event, is_approve_comment=is_approve_comment)
+        if decision is None:
+            return {}
+        return {
+            "role": decision.role,
+            "route_reason": decision.reason,
+            "target_metadata": decision.target_metadata,
+        }
+
+    def _role_binding(self, role: str | None) -> AgentRoleBinding:
+        role_name = role or default_role_for_stage("")
+        return self.role_bindings.get(role_name) or AgentRoleBinding(
+            role=role_name,
+            runtime=normalize_runtime(self.config.agent_runtime),
+            forbidden_actions=list(default_forbidden_actions(role_name)),
+        )
+
+    def _job_role_metadata(
+        self,
+        binding: AgentRoleBinding,
+        *,
+        route_reason: str | None = None,
+        target_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "role": binding.role,
+            "role_binding": binding.to_dict(),
+            "forbidden_actions": list(binding.forbidden_actions),
+        }
+        if binding.allowed_actions:
+            metadata["allowed_actions"] = list(binding.allowed_actions)
+        if route_reason:
+            metadata["route_reason"] = route_reason
+        if target_metadata:
+            metadata["target"] = dict(target_metadata)
+        return metadata
+
+    def _role_prompt_context(self, job: JobRecord) -> str:
+        role = job.role or str(job.metadata.get("role") or default_role_for_stage(job.stage))
+        binding = self._role_binding(role)
+        forbidden_actions = job.metadata.get("forbidden_actions")
+        if not isinstance(forbidden_actions, list):
+            forbidden_actions = list(binding.forbidden_actions)
+        lines = [
+            "Dani role policy:",
+            f"- Role: {binding.role}",
+            f"- Runtime binding: {binding.runtime}",
+        ]
+        if binding.display_name:
+            lines.append(f"- Agent binding: {binding.display_name}")
+        if binding.profile:
+            lines.append(f"- Profile: {binding.profile}")
+        if forbidden_actions:
+            lines.append("- Forbidden actions: " + ", ".join(str(action) for action in forbidden_actions))
+        if binding.allowed_actions:
+            lines.append("- Allowed actions: " + ", ".join(binding.allowed_actions))
+        if binding.prompt_policy:
+            lines.append(f"- Policy: {binding.prompt_policy}")
+        return "\n".join(lines)
+
+    def _with_role_prompt_context(self, job: JobRecord, prompt: str) -> str:
+        guarded_prompt = ensure_non_interactive_guard(prompt)
+        prompt_body = split_non_interactive_guard(guarded_prompt)
+        return f"{NON_INTERACTIVE_GUARD}\n{self._role_prompt_context(job)}\n\n{prompt_body}"
+
     def _preferred_runtime_for(self, job: JobRecord) -> str:
         runtime = job.metadata.get("preferred_runtime")
         if isinstance(runtime, str) and runtime:
             return normalize_runtime(runtime)
-        return normalize_runtime(self.config.agent_runtime)
+        return self._role_binding(job.role or str(job.metadata.get("role") or default_role_for_stage(job.stage))).runtime
 
     def _lineage_session_for(self, job: JobRecord) -> SessionRecord | None:
         if job.stage != "issue_followup":
@@ -1694,7 +1775,7 @@ class DaniService:
             prompt = self._build_issue_request_prompt(
                 repo, job, issue_number, issue_title, issue_body, resolved_runtime
             )
-            return self._apply_bridge_context(prompt, bridge_prompt)
+            return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
         if job.stage == "implementation":
             prompt = self._build_implementation_prompt(
@@ -1708,7 +1789,7 @@ class DaniService:
                 pr_body,
                 resolved_runtime,
             )
-            return self._apply_bridge_context(prompt, bridge_prompt)
+            return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
         if job.stage == "issue_followup":
             prompt = self._build_issue_followup_prompt(
@@ -1719,10 +1800,11 @@ class DaniService:
                 issue_body,
                 resolved_runtime,
             )
-            return self._apply_bridge_context(prompt, bridge_prompt)
+            return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
         if job.stage in ISSUE_COMMENT_RECOVERY_STAGES:
-            return self._build_issue_comment_recovery_prompt(repo, job, issue_number, issue_title, issue_body)
+            prompt = self._build_issue_comment_recovery_prompt(repo, job, issue_number, issue_title, issue_body)
+            return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
         if job.stage == "review_round":
             prompt = self._build_review_round_prompt(
@@ -1734,7 +1816,7 @@ class DaniService:
                 pr_body,
                 resolved_runtime,
             )
-            return self._apply_bridge_context(prompt, bridge_prompt)
+            return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
         if job.stage == "merge_conflict_resolution":
             prompt = self._build_merge_conflict_resolution_prompt(
@@ -1746,10 +1828,10 @@ class DaniService:
                 pr_body,
                 resolved_runtime,
             )
-            return self._apply_bridge_context(prompt, bridge_prompt)
+            return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
         prompt = self._build_final_verdict_prompt(job, issue_number, pr_number, pr_title, pr_body, resolved_runtime)
-        return self._apply_bridge_context(prompt, bridge_prompt)
+        return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
     def _apply_bridge_context(self, prompt: str, bridge_prompt: str) -> str:
         guarded_prompt = ensure_non_interactive_guard(prompt)
@@ -2284,6 +2366,7 @@ class DaniService:
             stage="issue_request",
             issue_number=event.number,
             metadata={"title": event.title or "", "body": event.body or ""},
+            **self._route_kwargs(event),
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
@@ -2361,6 +2444,7 @@ class DaniService:
             stage="implementation",
             issue_number=event.number,
             metadata=metadata,
+            **self._route_kwargs(event, is_approve_comment=True),
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
@@ -2593,6 +2677,7 @@ class DaniService:
                     "bridge_source_runtime": session.bridge_source_runtime,
                     "bridge_source_session_id": session.bridge_source_session_id,
                 },
+                **self._route_kwargs(event),
             )
             return {"status": "queued", "job_id": rerouted_job.id, "stage": rerouted_job.stage}
         job = self._enqueue_job(
@@ -2611,6 +2696,7 @@ class DaniService:
                 "bridge_source_runtime": session.bridge_source_runtime,
                 "bridge_source_session_id": session.bridge_source_session_id,
             },
+            **self._route_kwargs(event),
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
@@ -2665,6 +2751,7 @@ class DaniService:
                     "title": event.title or "",
                     "body": event.body or "",
                 },
+                **self._route_kwargs(event),
             )
             return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
@@ -2732,6 +2819,7 @@ class DaniService:
             pr_number=event.number,
             review_round=next_review_round,
             metadata=metadata,
+            **self._route_kwargs(event),
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 

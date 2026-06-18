@@ -202,6 +202,37 @@ def test_issue_request_persists_omx_session_id(tmp_path: Path) -> None:
     session = service.storage.list_sessions()[0]
     assert session.omx_session_id == "omx-" + session.job_id
 
+def test_issue_request_carries_reviewer_role_policy(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=22,
+            actor_login="human",
+            payload={},
+            body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.get_job(result["job_id"])
+    assert job is not None
+    assert job.role == "reviewer"
+    assert job.metadata["role"] == "reviewer"
+    assert job.metadata["route_reason"] == "issue_opened"
+    assert job.metadata["target"]["issue_number"] == 22
+    assert "push_commits" in job.metadata["forbidden_actions"]
+    session = service.storage.list_sessions()[0]
+    assert session.role == "reviewer"
+    prompt = omx_runner.launches[-1]["prompt"]
+    assert "Dani role policy:" in prompt
+    assert "- Role: reviewer" in prompt
+    assert "Forbidden actions: push_commits" in prompt
+
 
 def test_issue_request_verification_requires_exact_signature(tmp_path: Path) -> None:
     service, github, _ = make_service(tmp_path)
