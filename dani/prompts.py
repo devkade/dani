@@ -151,6 +151,7 @@ Requirements:
     python -m dani.github_helper ensure-pr --repo $repo --head $branch_name --base $dev_branch --title "Feature/#$issue_number" --body-file <pr-body.md>
   - If a PR already exists, push new commits to the same branch so the PR updates automatically
   - Update the PR body only if needed to keep the description/signature accurate
+  - Use `Closes #$issue_number` only when the PR fully implements the issue. If the PR is partial, describe the remaining scope and avoid auto-closing keywords.
 $signature_instructions
 
 After creating or updating the PR, exit.

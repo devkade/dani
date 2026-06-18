@@ -202,7 +202,7 @@ def test_issue_request_persists_omx_session_id(tmp_path: Path) -> None:
     session = service.storage.list_sessions()[0]
     assert session.omx_session_id == "omx-" + session.job_id
 
-def test_issue_request_carries_reviewer_role_policy(tmp_path: Path) -> None:
+def test_issue_request_carries_planner_role_policy(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
 
     result = service.handle_event(
@@ -221,17 +221,88 @@ def test_issue_request_carries_reviewer_role_policy(tmp_path: Path) -> None:
 
     job = service.storage.get_job(result["job_id"])
     assert job is not None
-    assert job.role == "reviewer"
-    assert job.metadata["role"] == "reviewer"
+    assert job.role == "planner"
+    assert job.metadata["role"] == "planner"
     assert job.metadata["route_reason"] == "issue_opened"
     assert job.metadata["target"]["issue_number"] == 22
     assert "push_commits" in job.metadata["forbidden_actions"]
     session = service.storage.list_sessions()[0]
-    assert session.role == "reviewer"
+    assert session.role == "planner"
     prompt = omx_runner.launches[-1]["prompt"]
     assert "Dani role policy:" in prompt
-    assert "- Role: reviewer" in prompt
+    assert "- Role: planner" in prompt
     assert "Forbidden actions: push_commits" in prompt
+
+
+def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    # Seed the planner lineage so refinement can resume the existing issue discussion.
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=44,
+            actor_login="human",
+            payload={},
+            body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    github.create_issue_comment(
+        "acme/demo",
+        44,
+        build_signature(stage="issue_readiness", job="reviewer-job", issue=44, readiness="needs_refinement"),
+    )
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=44,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["stage"] == "issue_followup"
+    jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=44)
+    assert jobs[-1].role == "planner"
+    assert jobs[-1].metadata["readiness"] == "needs_refinement"
+    assert omx_runner.resumes[-1]["job"].stage == "issue_followup"
+
+
+def test_check_status_queues_reviewer_check_review(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="check_status",
+            repo_full_name="acme/demo",
+            action="completed",
+            number=88,
+            actor_login="github-actions",
+            payload={"status": "completed", "conclusion": "failure"},
+            body="ci",
+            title="ci",
+            commit_sha="abc123",
+            is_pull_request=True,
+            pr_state="open",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["stage"] == "check_review"
+    job = service.storage.get_job(result["job_id"])
+    assert job is not None
+    assert job.role == "reviewer"
+    assert job.metadata["route_reason"] == "check_status_completed"
+    assert omx_runner.launches[-1]["job"].stage == "check_review"
 
 
 def test_issue_request_verification_requires_exact_signature(tmp_path: Path) -> None:

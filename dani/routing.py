@@ -8,6 +8,7 @@ from dani.models import NormalizedEvent
 
 ROLE_WORKER = "worker"
 ROLE_REVIEWER = "reviewer"
+ROLE_PLANNER = "planner"
 
 WORKER_FORBIDDEN_ACTIONS = (
     "merge_pull_request",
@@ -20,12 +21,14 @@ REVIEWER_FORBIDDEN_ACTIONS = (
     "merge_pull_request",
     "close_issue_without_instruction",
 )
+PLANNER_FORBIDDEN_ACTIONS = REVIEWER_FORBIDDEN_ACTIONS
 
 DEFAULT_ROLE_FOR_STAGE = {
-    "issue_request": ROLE_REVIEWER,
-    "issue_followup": ROLE_REVIEWER,
-    "issue_request_recovery": ROLE_REVIEWER,
-    "issue_followup_recovery": ROLE_REVIEWER,
+    "issue_request": ROLE_PLANNER,
+    "issue_followup": ROLE_PLANNER,
+    "issue_request_recovery": ROLE_PLANNER,
+    "issue_followup_recovery": ROLE_PLANNER,
+    "check_review": ROLE_REVIEWER,
     "review_round": ROLE_REVIEWER,
     "final_verdict": ROLE_REVIEWER,
     "implementation": ROLE_WORKER,
@@ -38,6 +41,7 @@ DEFAULT_ROLE_FOR_STAGE = {
 DEFAULT_FORBIDDEN_ACTIONS_BY_ROLE = {
     ROLE_WORKER: WORKER_FORBIDDEN_ACTIONS,
     ROLE_REVIEWER: REVIEWER_FORBIDDEN_ACTIONS,
+    ROLE_PLANNER: PLANNER_FORBIDDEN_ACTIONS,
 }
 
 PR_LIFECYCLE_ACTIONS = frozenset({"opened", "synchronize", "reopened", "ready_for_review", "review_requested"})
@@ -125,6 +129,11 @@ def default_role_bindings(agent_runtime: str) -> dict[str, AgentRoleBinding]:
             runtime=runtime,
             forbidden_actions=list(default_forbidden_actions(ROLE_REVIEWER)),
         ),
+        ROLE_PLANNER: AgentRoleBinding(
+            role=ROLE_PLANNER,
+            runtime=runtime,
+            forbidden_actions=list(default_forbidden_actions(ROLE_PLANNER)),
+        ),
     }
 
 
@@ -146,13 +155,15 @@ def parse_role_bindings(raw: object, *, agent_runtime: str) -> dict[str, AgentRo
 def route_event(event: NormalizedEvent, *, is_approve_comment: bool = False) -> RouteDecision | None:
     target = _target_metadata(event)
     if event.kind == "issue_opened":
-        return RouteDecision(ROLE_REVIEWER, "issue_request", "issue_opened", target)
+        return RouteDecision(ROLE_PLANNER, "issue_request", "issue_opened", target)
     if event.kind == "issue_comment" and is_approve_comment:
         return RouteDecision(ROLE_WORKER, "implementation", "issue_comment_approve", target)
     if event.kind == "issue_comment":
-        return RouteDecision(ROLE_REVIEWER, "issue_followup", "issue_comment_non_approve", target)
+        return RouteDecision(ROLE_PLANNER, "issue_followup", "issue_comment_non_approve", target)
     if event.kind == "pull_request_opened" and event.action in PR_LIFECYCLE_ACTIONS:
         return RouteDecision(ROLE_REVIEWER, "review_round", f"pull_request_{event.action}", target)
+    if event.kind == "check_status":
+        return RouteDecision(ROLE_REVIEWER, "check_review", f"check_status_{event.action}", target)
     if event.kind == "pull_request_opened":
         return RouteDecision(ROLE_REVIEWER, "review_round", "pull_request_lifecycle", target)
     return None

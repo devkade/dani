@@ -57,6 +57,7 @@ INELIGIBLE_EXTERNAL_PR_COMMENT = (
 RETARGET_REQUEST_STAGE = "retarget_request"
 ISSUE_REQUEST_RECOVERY_STAGE = "issue_request_recovery"
 ISSUE_FOLLOWUP_RECOVERY_STAGE = "issue_followup_recovery"
+CHECK_REVIEW_STAGE = "check_review"
 ISSUE_COMMENT_RECOVERY_STAGES = {
     ISSUE_REQUEST_RECOVERY_STAGE: "issue_request",
     ISSUE_FOLLOWUP_RECOVERY_STAGE: "issue_followup",
@@ -294,6 +295,9 @@ class DaniService:
         if event.kind == "pull_request_closed":
             return self._handle_pull_request_closed(repo, event)
 
+        if event.kind == "check_status":
+            return self._dispatch_check_status(repo, event)
+
         if event.kind == "issue_opened":
             return self._dispatch_issue_opened(repo, event)
 
@@ -328,6 +332,11 @@ class DaniService:
         if not self._is_authorized_approver(repo, event):
             self._react_unauthorized_approve(repo, event)
             return {"status": "ignored", "reason": "approver_not_authorized"}
+        readiness = self._issue_readiness(repo.full_name, event.number)
+        if readiness in {"not_ready", "needs_refinement"}:
+            return self._queue_issue_refinement(repo, event, readiness=readiness)
+        if readiness != "ready":
+            return {"status": "ignored", "reason": "issue_not_ready"}
         if self._has_existing_implementation_job(repo.full_name, event.number):
             return {"status": "ignored", "reason": "duplicate_implementation"}
         return self._queue_implementation(repo, event)
@@ -391,6 +400,112 @@ class DaniService:
             return {"status": "ignored", "reason": "max_followups_reached"}
         return self._queue_issue_followup(repo, event)
 
+    def _issue_readiness(self, repo_full_name: str, issue_number: int) -> str:
+        latest = self.github.latest_signature_comment(repo_full_name, issue_number, kind="issue")
+        if latest is None:
+            return "ready"
+        _comment, signature = latest
+        stage = str(signature.get("stage") or "")
+        if stage not in {"issue_request", "issue_followup", "issue_readiness"}:
+            return "missing"
+        raw = (
+            signature.get("readiness")
+            or signature.get("verdict")
+            or signature.get("status")
+            or "ready"
+        )
+        value = str(raw).strip().casefold().replace("-", "_")
+        if value in {"ready", "approved", "approve", "ok"}:
+            return "ready"
+        if value in {"not_ready", "needs_refinement", "refine", "changes_requested"}:
+            return "needs_refinement" if value != "not_ready" else "not_ready"
+        return "missing"
+
+    def _signature_requests_refinement(self, signature: dict[str, str]) -> bool:
+        stage = str(signature.get("stage") or "")
+        if stage not in {"issue_readiness", "issue_request", "issue_followup"}:
+            return False
+        raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
+        value = str(raw or "").strip().casefold().replace("-", "_")
+        return value in {"not_ready", "needs_refinement", "refine", "changes_requested"}
+
+    def _handle_issue_refinement_request(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
+        repo = self.storage.get_repo(event.repo_full_name)
+        if repo is None:
+            return {"status": "ignored", "reason": "missing_repo"}
+        issue_number = int(signature.get("issue") or event.number)
+        synthetic = NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name=event.repo_full_name,
+            action=event.action,
+            number=issue_number,
+            actor_login=event.actor_login,
+            payload=event.payload,
+            body=event.body,
+            title=event.title,
+            delivery_id=event.delivery_id,
+            issue_state=event.issue_state,
+            actor_type=event.actor_type,
+        )
+        return self._queue_issue_refinement(repo, synthetic, readiness=self._issue_readiness(event.repo_full_name, issue_number))
+
+    def _queue_issue_refinement(self, repo: RepoConfig, event: NormalizedEvent, *, readiness: str) -> dict[str, Any]:
+        if self._completed_followup_count(repo.full_name, event.number) >= self.config.max_issue_followups:
+            return {"status": "ignored", "reason": "max_followups_reached"}
+        session = self._latest_issue_lineage_session(event.repo_full_name, event.number)
+        if session is None or session.omx_session_id is None:
+            return {"status": "ignored", "reason": "missing_issue_session"}
+        lineage_runtime = self._resume_runtime_for_session(session)
+        lineage_runner = self._runner_for_runtime(lineage_runtime)
+        if not lineage_runner.can_resume(session.omx_session_id):
+            return {"status": "ignored", "reason": "missing_issue_session"}
+        job = self._enqueue_job(
+            repo,
+            stage="issue_followup",
+            issue_number=event.number,
+            metadata={
+                "title": event.title or "",
+                "body": event.payload.get("issue", {}).get("body", ""),
+                "comment_body": event.body or "",
+                "omx_session_id": session.omx_session_id,
+                "preferred_runtime": session.preferred_runtime or normalize_runtime(self.config.agent_runtime),
+                "effective_runtime": effective_session_runtime(session),
+                "native_session_runtime": session.native_session_runtime,
+                "fallback_reason": session.fallback_reason,
+                "bridge_source_runtime": session.bridge_source_runtime,
+                "bridge_source_session_id": session.bridge_source_session_id,
+                "readiness": readiness,
+                "refinement_reason": "issue_not_ready",
+            },
+            **self._route_kwargs(event),
+        )
+        return {"status": "queued", "job_id": job.id, "stage": job.stage}
+
+    def _dispatch_check_status(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
+        if event.pr_state == "closed":
+            return {"status": "ignored", "reason": "pr_not_open"}
+        pr_number = event.number
+        if pr_number <= 0:
+            return {"status": "ignored", "reason": "missing_pr_number"}
+        if self.storage.is_terminal_pr(repo.full_name, pr_number):
+            return {"status": "ignored", "reason": "pr_terminal"}
+        job = self._enqueue_job(
+            repo,
+            stage=CHECK_REVIEW_STAGE,
+            issue_number=self._extract_issue_number(event.body),
+            pr_number=pr_number,
+            metadata={
+                "title": event.title or f"PR #{pr_number}",
+                "body": event.body or "",
+                "check_action": event.action,
+                "check_status": event.payload.get("status"),
+                "check_conclusion": event.payload.get("conclusion"),
+                "commit_sha": event.commit_sha,
+            },
+            **self._route_kwargs(event),
+        )
+        return {"status": "queued", "job_id": job.id, "stage": job.stage}
+
     def _dispatch_merge_conflict_resolution_request(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
         if event.pr_state == "closed":
             return {"status": "ignored", "reason": "pr_not_open"}
@@ -446,6 +561,9 @@ class DaniService:
         stage = signature.get("stage")
         if stage == "review_round":
             return self._handle_review_round_event(event, signature)
+
+        if event.kind == "issue_comment" and self._signature_requests_refinement(signature):
+            return self._handle_issue_refinement_request(event, signature)
 
         if stage == "implementation" and event.kind == "pull_request_comment":
             return self._handle_implementation_agent_event(event, signature)
@@ -1806,7 +1924,7 @@ class DaniService:
             prompt = self._build_issue_comment_recovery_prompt(repo, job, issue_number, issue_title, issue_body)
             return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
 
-        if job.stage == "review_round":
+        if job.stage in {"review_round", CHECK_REVIEW_STAGE}:
             prompt = self._build_review_round_prompt(
                 repo,
                 job,
@@ -1858,7 +1976,7 @@ class DaniService:
         if job.stage == "implementation":
             self._verify_implementation_side_effect(repo, job)
             return
-        if job.stage == "review_round":
+        if job.stage in {"review_round", CHECK_REVIEW_STAGE}:
             self._verify_review_round_side_effect(repo, job)
             return
         if job.stage == "merge_conflict_resolution":
@@ -2048,7 +2166,7 @@ class DaniService:
         runtime: str,
     ) -> str:
         signature_fields: dict[str, int | str] = {
-            "stage": "review_round",
+            "stage": job.stage,
             "job": job.id,
             "pr": pr_number,
             "round": job.review_round or 1,
@@ -2189,7 +2307,7 @@ class DaniService:
 
     def _verify_review_round_side_effect(self, repo: RepoConfig, job: JobRecord) -> None:
         signature_fields: dict[str, int | str] = {
-            "stage": "review_round",
+            "stage": job.stage,
             "job": job.id,
             "pr": int(job.pr_number or 0),
             "round": job.review_round or 1,
@@ -2539,6 +2657,8 @@ class DaniService:
         changes: dict[str, Any] = {"status": "agent_running", "retryable": True}
         if job.stage == "review_round":
             changes["review_state"] = f"round_{job.review_round or 1}_running"
+        elif job.stage == CHECK_REVIEW_STAGE:
+            changes["review_state"] = "check_review_running"
         elif job.stage == "final_verdict":
             changes["auto_merge_state"] = "verdict_running"
         elif job.stage == "merge_conflict_resolution":
@@ -2549,6 +2669,8 @@ class DaniService:
         changes: dict[str, Any] = {"status": "agent_completed", "error": ""}
         if job.stage == "review_round":
             changes["review_state"] = f"round_{job.review_round or 1}_completed"
+        elif job.stage == CHECK_REVIEW_STAGE:
+            changes["review_state"] = "check_review_completed"
         elif job.stage == "final_verdict":
             changes["auto_merge_state"] = "verdict_completed"
         elif job.stage == "merge_conflict_resolution":
@@ -2559,6 +2681,8 @@ class DaniService:
         changes: dict[str, Any] = {"status": "failed", "error": error, "retryable": True}
         if job.stage == "review_round":
             changes["review_state"] = f"round_{job.review_round or 1}_failed"
+        elif job.stage == CHECK_REVIEW_STAGE:
+            changes["review_state"] = "check_review_failed"
         elif job.stage in {"final_verdict", "merge_conflict_resolution"}:
             changes["auto_merge_state"] = f"{job.stage}_failed"
         self._update_work_line_state(job, **changes)

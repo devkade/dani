@@ -216,3 +216,31 @@ def test_normalize_pull_request_closed_unmerged_event() -> None:
     assert event.kind == "pull_request_closed"
     assert event.pr_state == "closed"
     assert event.pr_merged is False
+
+
+def test_normalize_check_run_with_pull_request() -> None:
+    event = normalize_event(
+        "check_run",
+        {
+            "action": "completed",
+            "repository": {"full_name": "acme/demo"},
+            "sender": {"login": "github-actions", "type": "Bot"},
+            "check_run": {
+                "name": "ci",
+                "status": "completed",
+                "conclusion": "failure",
+                "head_sha": "abc123",
+                "pull_requests": [{"number": 21}],
+            },
+        },
+        delivery_id="check-1",
+    )
+
+    assert event is not None
+    assert event.kind == "check_status"
+    assert event.action == "completed"
+    assert event.number == 21
+    assert event.title == "ci"
+    assert event.commit_sha == "abc123"
+    assert event.is_pull_request is True
+    assert event.actor_type == "Bot"

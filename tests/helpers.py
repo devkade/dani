@@ -271,12 +271,12 @@ class FakeOmxRunner:
                     title=f"Feature/#{issue_number}",
                     head_branch=str(job.metadata.get("branch_name") or f"feature/#{issue_number}"),
                 )
-        elif job.stage == "review_round":
+        elif job.stage in {"review_round", "check_review"}:
             pr_number = int((signature or {}).get("pr", job.pr_number or 0))
             self.github.add_pr_signature(
                 repo_full_name,
                 pr_number,
-                build_signature(stage="review_round", job=job.id, pr=pr_number, round=job.review_round or 1),
+                build_signature(stage=job.stage, job=job.id, pr=pr_number, round=job.review_round or 1),
             )
         elif job.stage == "merge_conflict_resolution":
             pr_number = int((signature or {}).get("pr", job.pr_number or 0))
