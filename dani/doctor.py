@@ -828,9 +828,12 @@ VALID_AGENT_RUNTIMES = frozenset({
     "oh-my-openagents",
     "oh-my-openagent",
     "opencode",
+    "gjc",
+    "gajae-code",
 })
 OMX_FAMILY = frozenset({"omx", "oh-my-codex", "codex"})
 OMO_FAMILY = frozenset({"omo", "oh-my-openagents", "oh-my-openagent", "opencode"})
+GJC_FAMILY = frozenset({"gjc", "gajae-code"})
 
 
 def _resolved_agent_runtime(ctx: CheckContext) -> str:
@@ -1021,6 +1024,23 @@ def _check_binaries(ctx: CheckContext) -> CheckResult:
     else:
         records.append({
             "name": "opencode",
+            "found": None,
+            "required": False,
+            "severity": CheckStatus.SKIP.value,
+            "skip_reason": f"agent_runtime={runtime}",
+        })
+    if runtime in GJC_FAMILY:
+        records.append(
+            _binary_record(
+                "gjc",
+                required=True,
+                timeout_seconds=ctx.timeout_seconds,
+                severity_when_missing=CheckStatus.FAIL,
+            )
+        )
+    else:
+        records.append({
+            "name": "gjc",
             "found": None,
             "required": False,
             "severity": CheckStatus.SKIP.value,
@@ -1774,6 +1794,8 @@ def _classify_ps_command(command: str) -> str | None:
         return "opencode_serve"
     if "opencode run" in command:
         return "opencode_run"
+    if "gjc -p" in command or "gjc --resume" in command:
+        return "gjc_print"
     return None
 
 
@@ -1796,7 +1818,7 @@ def _check_process_sprawl(ctx: CheckContext) -> CheckResult:
         if len(parts) >= 3:
             pid_records.append((parts[0].strip(), parts[1].strip(), parts[2].strip()))
 
-    classifier_counts: dict[str, int] = {"omx_exec": 0, "opencode_serve": 0, "opencode_run": 0}
+    classifier_counts: dict[str, int] = {"omx_exec": 0, "opencode_serve": 0, "opencode_run": 0, "gjc_print": 0}
     samples: list[dict[str, Any]] = []
     sample_cap = 10
 

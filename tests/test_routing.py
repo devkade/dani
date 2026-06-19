@@ -103,6 +103,14 @@ def test_parse_role_bindings_default_to_global_agent_runtime() -> None:
     assert "merge_pull_request" in bindings[ROLE_WORKER].forbidden_actions
     assert "push_commits" in bindings[ROLE_REVIEWER].forbidden_actions
     assert "push_commits" in bindings[ROLE_PLANNER].forbidden_actions
+def test_parse_role_bindings_accepts_global_gjc_runtime() -> None:
+    bindings = parse_role_bindings({}, agent_runtime="gjc")
+
+    assert bindings[ROLE_WORKER].runtime == "gjc"
+    assert bindings[ROLE_REVIEWER].runtime == "gjc"
+    assert bindings[ROLE_PLANNER].runtime == "gjc"
+
+
 
 
 def test_parse_role_bindings_overrides_single_role_policy() -> None:
@@ -123,6 +131,21 @@ def test_parse_role_bindings_overrides_single_role_policy() -> None:
     assert bindings[ROLE_REVIEWER].display_name == "Review Bot"
     assert bindings[ROLE_REVIEWER].forbidden_actions == ["push_commits"]
     assert bindings[ROLE_REVIEWER].prompt_policy == "Read-only reviewer."
+def test_parse_role_bindings_accepts_gjc_role_override() -> None:
+    bindings = parse_role_bindings(
+        {
+            "planner": {
+                "runtime": "gjc",
+                "display_name": "GJC Planner",
+            }
+        },
+        agent_runtime="omx",
+    )
+
+    assert bindings[ROLE_WORKER].runtime == "omx"
+    assert bindings[ROLE_PLANNER].runtime == "gjc"
+    assert bindings[ROLE_PLANNER].display_name == "GJC Planner"
+
 
 
 def test_route_check_status_to_reviewer_check_review() -> None:

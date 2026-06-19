@@ -35,6 +35,7 @@ ROLE: REVIEWER READINESS AGENT (read-only gatekeeper, no implementation).
 - If the request is clear and safe to implement, mark it ready.
 - If requirements are missing, contradictory, unsafe, or need more planning, mark it not_ready or needs_refinement.
 - A worker implementation may launch only after your latest issue comment carries the ready signature below.
+$runtime_stage_instructions
 
 Issue body:
 $issue_body
@@ -85,6 +86,7 @@ ROLE: PLANNING AGENT (read-only analysis, no implementation).
 - Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
 - Do NOT promise to "create a PR", "open a branch", "write the code", "push commits", or "do the work next". Phrase the plan as "the implementation agent will...".
 - Your comment is the entire handoff. Make it self-contained: anything the implementation agent must know has to be IN the comment text.
+$runtime_stage_instructions
 
 Issue body:
 $issue_body
@@ -144,6 +146,7 @@ ROLE: PLANNING AGENT (read-only analysis, no implementation).
 - Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
 - Do NOT promise to "create a PR", "open a branch", "write the code", "push commits", or "do the work next". Phrase next steps as "the implementation agent will...".
 - Your comment is the entire handoff. Make it self-contained: anything the implementation agent must know has to be IN the comment text or in earlier visible discussion.
+$runtime_stage_instructions
 
 Original issue body:
 $issue_body
@@ -189,6 +192,7 @@ $discussion
 $pr_context
 
 Implement the approved change.
+$runtime_stage_instructions
 Requirements:
 - Use $$ralph to finish the work
 - Write tests first (TDD)
@@ -219,6 +223,7 @@ Recent discussion:
 $discussion
 
 $review_mode_note
+$runtime_stage_instructions
 Use the code locally and run $$code-review before writing the review comment.
 Do real verification, not only static inspection.
 Checklist:
@@ -277,6 +282,7 @@ $pr_body
 Review history:
 $discussion
 
+$runtime_stage_instructions
 Leave exactly one GitHub PR comment for this review pass.
 Checklist:
 - [ ] Verdict: APPROVE or REJECT
@@ -323,13 +329,66 @@ After the push succeeds, exit.
 
 
 # omx uses codex shell-slash commands ($ralph, $code-review); omo (opencode)
-# has neither, so the equivalent intents are swapped in post-render: ralph loop
-# -> ultrawork mode (always-on for omo), $code-review -> Momus-Plan-Critic subagent.
+# and gjc have different command surfaces, so equivalent intents are swapped
+# in post-render.
 _RUNTIME_SUBSTITUTIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "omo": (
         ("$code-review", "the Momus-Plan-Critic subagent for rigorous verification"),
         ("$ralph", "ultrawork"),
     ),
+    "gjc": (
+        (
+            "$code-review",
+            "the GJC quality-gate review covering architecture, product behavior, code maintainability, and real verification",
+        ),
+        ("$ralph", "the GJC ultragoal-style execution workflow from the approved ralplan-style plan"),
+    ),
+}
+
+_RUNTIME_STAGE_INSTRUCTIONS: dict[str, dict[str, str]] = {
+    "gjc": {
+        "issue_request": (
+            "GJC runtime guidance:\n"
+            "- Use a ralplan-style consensus planning pass. This is read-only planning.\n"
+            "- Do not edit source, create branches, commit, push, open a PR, invoke ultragoal/team, or wait for approval.\n"
+            "- Produce the pending-approval plan as the GitHub issue comment.\n"
+            "- Include principles, decision drivers, viable options, risks, acceptance criteria, and verification steps.\n"
+            "- The later implementation session will only receive this comment through GitHub discussion."
+        ),
+        "issue_followup": (
+            "GJC runtime guidance:\n"
+            "- Use a ralplan-style revision pass.\n"
+            "- Update the prior plan from the new comment.\n"
+            "- Do not implement.\n"
+            "- Keep the revised pending-approval handoff self-contained in the GitHub issue comment."
+        ),
+        "issue_readiness_review": (
+            "GJC runtime guidance:\n"
+            "- Act as the ralplan approval gate for this issue discussion.\n"
+            "- Mark ready only when scope, acceptance criteria, risks, and verification steps are concrete enough for ultragoal-style execution.\n"
+            "- If the issue is vague, unsafe, or missing testable acceptance criteria, mark needs_refinement or not_ready."
+        ),
+        "implementation": (
+            "GJC runtime guidance:\n"
+            "- Use an ultragoal-style execution pass.\n"
+            "- Treat the approved issue discussion as the ralplan-approved plan.\n"
+            "- Do not restart ralplan and do not wait for approval.\n"
+            "- Implement the bounded goal, run focused tests, run cleanup/review/QA checks, commit, push, and ensure the PR exists or is updated."
+        ),
+        "review_round": (
+            "GJC runtime guidance:\n"
+            "- Use a GJC quality-gate review.\n"
+            "- Cover architecture, product behavior, and code maintainability.\n"
+            "- Run real verification and at least one edge/adversarial check.\n"
+            "- Post exactly one PR comment with evidence and the required signature."
+        ),
+        "final_verdict": (
+            "GJC runtime guidance:\n"
+            "- Use a strict GJC final gate.\n"
+            "- APPROVE only when architecture, product behavior, code quality, and verification evidence are clean.\n"
+            "- Otherwise REJECT with concrete next actions."
+        ),
+    }
 }
 
 
@@ -354,13 +413,18 @@ def render_prompt(template_name: str, context: dict[str, Any], *, runtime: str =
     context.setdefault("round_total", "3")
     context.setdefault("review_mode_note", "")
     context.setdefault("branch_name", "")
+    runtime_key = (runtime or "omx").strip().lower()
+    context.setdefault(
+        "runtime_stage_instructions",
+        _RUNTIME_STAGE_INSTRUCTIONS.get(runtime_key, {}).get(template_name, ""),
+    )
     if template_name != "final_verdict" and "signature" not in context:
         context = {
             **context,
             "signature": build_signature(stage=template_name, job_id=context.get("job_id", "unknown")),
         }
     rendered = template.substitute({key: "" if value is None else str(value) for key, value in context.items()})
-    substitutions = _RUNTIME_SUBSTITUTIONS.get((runtime or "omx").strip().lower())
+    substitutions = _RUNTIME_SUBSTITUTIONS.get(runtime_key)
     if substitutions:
         for needle, replacement in substitutions:
             rendered = rendered.replace(needle, replacement)

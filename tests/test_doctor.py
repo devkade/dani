@@ -15,6 +15,7 @@ from dani.doctor import (
     CheckResult,
     CheckStatus,
     DoctorReport,
+    _classify_ps_command,
     _OutputPathError,
     _ThresholdParseError,
     cap_list,
@@ -530,6 +531,22 @@ def test_config_env_warn_on_bad_runtime(tmp_path: Path):
     result = _check_config_env(ctx)
     assert result.status == CheckStatus.WARN
     assert "made-up" in result.summary
+def test_config_env_accepts_gjc_runtime(tmp_path: Path):
+    ctx = _make_ctx(
+        tmp_path,
+        env={
+            "DANI_WEBHOOK_SECRET": "x",
+            "DANI_GITHUB_TOKEN": "y",
+            "DANI_AGENT_RUNTIME": "gjc",
+        },
+    )
+
+    result = _check_config_env(ctx)
+
+    assert result.status == CheckStatus.OK
+    assert result.details["agent_runtime"] == "gjc"
+
+
 
 
 def test_config_env_fail_on_config_parse_error(tmp_path: Path):
@@ -589,6 +606,29 @@ def test_binaries_omo_runtime_fails_without_opencode(tmp_path: Path, monkeypatch
     result = _check_binaries(ctx)
     assert result.status == CheckStatus.FAIL
     assert "opencode" in result.summary
+def test_binaries_gjc_runtime_requires_gjc_only_for_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    fake_paths = {
+        "git": "/usr/bin/git",
+        "gh": "/usr/bin/gh",
+        "gjc": "/usr/bin/gjc",
+    }
+    monkeypatch.setattr("shutil.which", lambda name: fake_paths.get(name))
+    monkeypatch.setattr("dani.doctor._probe_binary_version", lambda binary, *, timeout_seconds: "v1")
+    ctx = _make_ctx(tmp_path, env={"DANI_AGENT_RUNTIME": "gjc"})
+
+    result = _check_binaries(ctx)
+
+    assert result.status == CheckStatus.OK
+    records = {r["name"]: r for r in result.details["binaries"]}
+    assert records["gjc"]["required"] is True
+    assert records["omx"]["severity"] == "skip"
+    assert records["opencode"]["severity"] == "skip"
+
+
+def test_process_sprawl_classifies_gjc_print_process() -> None:
+    assert _classify_ps_command("/bin/sh -c exec gjc -p prompt") == "gjc_print"
+    assert _classify_ps_command("/bin/sh -c exec gjc --resume gjc-session -p prompt") == "gjc_print"
+
 
 
 def test_storage_files_ok(populated_data_dir: Path):

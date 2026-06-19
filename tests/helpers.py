@@ -368,7 +368,7 @@ class FakeRuntimeRunner(FakeOmxRunner):
     def __init__(self, github: FakeGitHubCLI, *, runtime_name: str) -> None:
         super().__init__(github)
         self.runtime_name = runtime_name
-        self.session_id_prefix = "ses_" if runtime_name == "omo" else "omx-"
+        self.session_id_prefix = "ses_" if runtime_name == "omo" else "gjc-" if runtime_name == "gjc" else "omx-"
         self.wait_errors: list[Exception] = []
 
     def queue_wait_error(self, exc: Exception) -> None:
