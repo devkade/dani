@@ -201,6 +201,7 @@ cython_debug/
 .ouroboros/
 .uv-cache/
 .dani/
+.gjc/
 
 # PyPI configuration file
 .pypirc

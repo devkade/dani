@@ -1,16 +1,16 @@
 # dani
 
-Simple GitHub webhook -> agent automation loop. Supports two pluggable agent
-runtimes: **Oh-My-Codex (`omx`, default)** and **Oh-My-OpenAgents (`omo`,
-opt-in)**.
+Simple GitHub webhook -> agent automation loop. Supports three pluggable agent
+runtimes: **Oh-My-Codex (`omx`, default)**, **Oh-My-OpenAgents (`omo`,
+opt-in)**, and **Gajae Code (`gjc`, opt-in)**.
 
 ## What v1 includes
 - Typer CLI
 - FastAPI webhook server
 - Registered repos only
 - Repo-serial / cross-repo parallel job handling
-- Pluggable agent runtime: non-interactive `omx exec` / `omx exec resume` (default)
-  or HTTP-backed Oh-My-OpenAgents (`opencode serve`)
+- Pluggable agent runtime: non-interactive `omx exec` / `omx exec resume` (default),
+  HTTP-backed Oh-My-OpenAgents (`opencode serve`), or non-interactive GJC (`gjc -p`)
 - Separate prompt templates in `dani/prompts.py`
 - Workflows for:
   - issue request report
@@ -23,10 +23,11 @@ opt-in)**.
   - final verdict + auto-merge on APPROVE
 
 ## Environment
-Required local tools (at least one depending on the selected runtime):
+Required local tools (depending on the selected runtime):
 - `git`
 - `omx` — required when `DANI_AGENT_RUNTIME=omx` (default)
 - `opencode` — required when `DANI_AGENT_RUNTIME=omo`
+- `gjc` — required when `DANI_AGENT_RUNTIME=gjc`
 
 Required environment variables:
 - `DANI_WEBHOOK_SECRET`
@@ -36,6 +37,7 @@ Optional environment variables:
 - `DANI_AGENT_RUNTIME` — selects the agent backend. Accepted values:
   - `omx` / `oh-my-codex` / `codex` (default)
   - `omo` / `oh-my-openagents` / `oh-my-openagent` / `opencode`
+  - `gjc` / `gajae-code`
 - `DANI_AGENT_TIMEOUT_SECONDS` — overrides the per-job agent wait timeout in seconds.
 - `DANI_ISSUE_READY_LAUNCH` — selects what happens after a reviewer marks an issue ready:
   - `manual` (default) waits for maintainer `/approve`.
@@ -45,7 +47,7 @@ Optional config file (`~/.dani/config.json` by default, or `<data-dir>/config.js
 
 ```json
 {
-  "agent_runtime": "omo",
+  "agent_runtime": "gjc",
   "agent_timeout_seconds": 3600,
   "issue_ready_launch": "manual"
 }
@@ -94,6 +96,18 @@ submission, completion via SSE, and resume. Install `opencode` (the
 directory is trusted at least once via `opencode run 'hello'` before pointing
 dani at it.
 
+## Gajae Code (GJC) prerequisite
+When running with `DANI_AGENT_RUNTIME=gjc`, dani launches GJC in
+non-interactive print mode with `gjc -p` and resumes only when a trustworthy
+GJC session id or session file path is available. Install `gjc` and trust the
+target repository at least once in GJC before using webhook automation there.
+Dani maps its GitHub-driven stages onto GJC workflow semantics instead of
+handing native `.gjc` workflow state directly to `ralplan` or `ultragoal`:
+planning jobs produce ralplan-style pending-approval comments, approved
+implementation jobs run ultragoal-style execution from that approved plan, and
+PR review jobs run a GJC quality-gate review. Runtime-specific prompt
+substitutions still replace Codex-only `$ralph` and `$code-review` tokens.
+
 ## CLI
 ```bash
 dani register-repo owner/name /absolute/path/to/repo
@@ -140,7 +154,7 @@ dani doctor --json --output /tmp/dani-report.json
 | Name | Description |
 |---|---|
 | `config_env` | webhook secret, GitHub token, agent runtime, config.json parse status |
-| `binaries` | `git`, `gh`, plus runtime-specific `omx`/`codex` or `opencode` (skips opencode if `DANI_OPENCODE_SERVER_URL` is set) |
+| `binaries` | `git`, `gh`, plus runtime-specific `omx`/`codex`, `opencode`, or `gjc` (skips opencode if `DANI_OPENCODE_SERVER_URL` is set) |
 | `storage_files` | parse-ability of `registry.json`/`jobs.json`/`sessions.json`/`processed-events.json`/`terminal-targets.json`; tolerates one transient parse error per file plus an `events.jsonl` last-line append race |
 | `registered_repos` | each registered repo's `local_path` is a git working tree and resolves both `main_branch` and `dev_branch` |
 | `github_auth` | resolves the GitHub token, verifies it with the minimum `Github.get_rate_limit()` call, reports rate-limit headroom; never echoes the token, only its source env-var name |
@@ -149,7 +163,7 @@ dani doctor --json --output /tmp/dani-report.json
 | `stuck_sessions` | FAILs on confirmed A-class drift (session `launched` while linked job is terminal — re-validated with a 100ms re-snapshot and a 60s grace window); WARNs on long-running launches and orphans |
 | `disk_usage` | size of each storage file plus a soft-deadlined walk of `runs/`; thresholds for warn/fail per target |
 | `backup_files` | accumulated `*.bak.*` files in `data_dir`: count / oldest age / total bytes |
-| `process_sprawl` | counts alive `omx exec` / `opencode serve` / `opencode run` processes; reports only PID/PPID/etime/classifier — never raw argv |
+| `process_sprawl` | counts alive `omx exec` / `opencode serve` / `opencode run` / `gjc -p` processes; reports only PID/PPID/etime/classifier — never raw argv |
 
 ### Exit codes
 
@@ -184,7 +198,7 @@ State is stored under `~/.dani/` by default:
 - `jobs.json`
 - `sessions.json`
 - `events.jsonl`
-- `runs/` for generated agent-runtime prompt/script artifacts (omx or omo)
+- `runs/` for generated agent-runtime prompt/script artifacts (omx, omo, or gjc)
 
 
 ## GitHub surfaces

@@ -47,6 +47,29 @@ def test_implementation_prompt_for_omo_replaces_ralph_with_ultrawork() -> None:
     assert "$ralph" not in prompt
     assert "ultrawork" in prompt
 
+def test_implementation_prompt_for_gjc_replaces_ralph_with_gjc_loop() -> None:
+    prompt = render_prompt(
+        "implementation",
+        {
+            "repo": "acme/demo",
+            "local_path": "workspace/demo",
+            "issue_number": 7,
+            "issue_title": "Need a bot",
+            "issue_body": "Implement it",
+            "discussion": "approved",
+            "pr_context": "",
+            "pr_number": "",
+            "dev_branch": "dev",
+            "signature": "<!-- dani:stage=implementation;job=abc;issue=7 -->",
+            "signature_instructions": "Use this signature in the PR body:\n<!-- dani:stage=implementation;job=abc;issue=7 -->",
+        },
+        runtime="gjc",
+    )
+
+    assert "$ralph" not in prompt
+    assert "GJC ultragoal-style execution workflow from the approved ralplan-style plan" in prompt
+
+
 
 def test_implementation_prompt_for_omx_explicit_runtime_still_keeps_ralph() -> None:
     prompt = render_prompt(
@@ -437,6 +460,23 @@ def test_review_round_prompt_for_omo_delegates_to_momus_plan_critic() -> None:
     assert "$code-review" not in prompt
     assert "Momus-Plan-Critic" in prompt
     assert "subagent" in prompt.lower()
+def test_review_round_prompt_for_gjc_uses_gjc_review_pass() -> None:
+    prompt = render_prompt(
+        "review_round",
+        {
+            "repo": "acme/demo",
+            "pr_number": 5,
+            "pr_title": "Feature",
+            "pr_body": "Body",
+            "discussion": "history",
+            "round_number": 2,
+            "signature": "<!-- dani:stage=review_round;job=abc;pr=5;round=2 -->",
+        },
+        runtime="gjc",
+    )
+
+    assert "$code-review" not in prompt
+    assert "GJC quality-gate review" in prompt
 
 
 def test_review_round_prompt_for_omo_does_not_mention_ralph_command() -> None:
@@ -543,6 +583,59 @@ def test_merge_conflict_resolution_prompt_requires_recheck_without_direct_merge(
     assert "stage=merge_conflict_resolution" in prompt
     assert "gh pr comment 5 --repo acme/demo --body-file <merge-conflict-comment.md>" in prompt
 
+
+
+def test_issue_request_prompt_for_gjc_uses_ralplan_style_pending_plan() -> None:
+    prompt = render_prompt("issue_request", _issue_request_context(), runtime="gjc")
+
+    assert "ralplan-style consensus planning pass" in prompt
+    assert "pending-approval plan" in prompt
+    assert "Do not edit source" in prompt
+    assert "wait for approval" in prompt
+    assert "principles, decision drivers, viable options" in prompt
+
+
+def test_issue_followup_prompt_for_gjc_uses_ralplan_revision() -> None:
+    prompt = render_prompt("issue_followup", _issue_followup_context(), runtime="gjc")
+
+    assert "ralplan-style revision pass" in prompt
+    assert "Do not implement" in prompt
+    assert "revised pending-approval handoff" in prompt
+
+
+def test_issue_readiness_review_prompt_for_gjc_acts_as_approval_gate() -> None:
+    prompt = render_prompt("issue_readiness_review", _issue_readiness_review_context(), runtime="gjc")
+
+    assert "ralplan approval gate" in prompt
+    assert "concrete enough for ultragoal-style execution" in prompt
+    assert "missing testable acceptance criteria" in prompt
+
+
+def test_implementation_prompt_for_gjc_uses_ultragoal_execution_from_approved_plan() -> None:
+    prompt = render_prompt("implementation", _implementation_context(), runtime="gjc")
+
+    assert "ultragoal-style execution pass" in prompt
+    assert "approved issue discussion as the ralplan-approved plan" in prompt
+    assert "Do not restart ralplan" in prompt
+    assert "commit, push" in prompt
+    assert "$ralph" not in prompt
+
+
+def test_review_round_prompt_for_gjc_uses_quality_gate_review() -> None:
+    prompt = render_prompt("review_round", _review_round_context(), runtime="gjc")
+
+    assert "GJC quality-gate review" in prompt
+    assert "architecture, product behavior, and code maintainability" in prompt
+    assert "edge/adversarial check" in prompt
+    assert "$code-review" not in prompt
+
+
+def test_final_verdict_prompt_for_gjc_uses_strict_final_gate() -> None:
+    prompt = render_prompt("final_verdict", _final_verdict_context(), runtime="gjc")
+
+    assert "strict GJC final gate" in prompt
+    assert "APPROVE only when architecture, product behavior, code quality, and verification evidence are clean" in prompt
+    assert "Otherwise REJECT with concrete next actions" in prompt
 
 def _final_verdict_context() -> dict[str, object]:
     return {
@@ -651,7 +744,7 @@ def test_split_non_interactive_guard_accepts_unguarded_prompt() -> None:
 
 
 @pytest.mark.parametrize("template_name", sorted(TEMPLATES))
-@pytest.mark.parametrize("runtime", ["omx", "omo"])
+@pytest.mark.parametrize("runtime", ["omx", "omo", "gjc"])
 def test_every_template_prepends_non_interactive_guard(
     template_name: str,
     runtime: str,

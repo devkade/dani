@@ -8,6 +8,7 @@ from uuid import uuid4
 
 RUNTIME_OMX = "omx"
 RUNTIME_OMO = "omo"
+RUNTIME_GJC = "gjc"
 DEFAULT_AGENT_TIMEOUT_SECONDS = 3600.0
 
 
@@ -18,6 +19,8 @@ def utc_now() -> str:
 def infer_runtime_from_session_id(session_id: str | None) -> str | None:
     if not session_id:
         return None
+    if session_id.startswith("gjc-") or "/.gjc/agent/sessions/" in session_id:
+        return RUNTIME_GJC
     if session_id.startswith("ses_"):
         return RUNTIME_OMO
     return RUNTIME_OMX

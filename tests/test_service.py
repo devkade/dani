@@ -9,7 +9,7 @@ import pytest
 from dani.agent_runner import AgentRunner
 from dani.errors import ClaudeUsageLimitError, RolloutMissingError
 from dani.github import GitHubCLI
-from dani.models import RUNTIME_OMO, RUNTIME_OMX, DaniConfig, JobRecord, NormalizedEvent, SessionRecord
+from dani.models import RUNTIME_GJC, RUNTIME_OMO, RUNTIME_OMX, DaniConfig, JobRecord, NormalizedEvent, SessionRecord
 from dani.omx_runner import OmxRunner
 from dani.prompts import NON_INTERACTIVE_GUARD
 from dani.service import DaniService
@@ -146,6 +146,33 @@ def make_omo_preferred_service(
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, omo_runner, omx_runner
+def make_gjc_bound_service(tmp_path: Path) -> tuple[DaniService, FakeGitHubCLI, FakeRuntimeRunner]:
+    config = DaniConfig(
+        data_dir=tmp_path / ".dani",
+        webhook_secret=TEST_SECRET,
+        agent_runtime=RUNTIME_OMX,
+        role_bindings={
+            "worker": {"runtime": RUNTIME_GJC},
+            "planner": {"runtime": RUNTIME_GJC},
+            "reviewer": {"runtime": RUNTIME_GJC},
+        },
+    )
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeRuntimeRunner(github, runtime_name=RUNTIME_OMX)
+    gjc_runner = FakeRuntimeRunner(github, runtime_name=RUNTIME_GJC)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        runtime_runners={RUNTIME_GJC: cast(AgentRunner, gjc_runner)},
+        work_line_manager=FakeWorkLineManager(),
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+    return service, github, gjc_runner
+
 
 
 def make_pr_event(
@@ -240,6 +267,65 @@ def test_issue_opened_carries_reviewer_role_policy(tmp_path: Path) -> None:
     assert "Dani role policy:" in prompt
     assert "- Role: reviewer" in prompt
     assert "Forbidden actions: push_commits" in prompt
+def test_role_bound_gjc_runtime_dispatches_and_persists_metadata(tmp_path: Path) -> None:
+    service, _, gjc_runner = make_gjc_bound_service(tmp_path)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=72,
+            actor_login="human",
+            payload={},
+            body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.get_job(result["job_id"])
+    assert job is not None
+    assert job.role == "reviewer"
+    assert job.metadata["preferred_runtime"] == RUNTIME_GJC
+    assert job.metadata["effective_runtime"] == RUNTIME_GJC
+    assert job.metadata["native_session_runtime"] == RUNTIME_GJC
+    assert "push_commits" in job.metadata["forbidden_actions"]
+    assert len(gjc_runner.launches) == 1
+    assert gjc_runner.launches[0]["job"].id == job.id
+    prompt = gjc_runner.launches[0]["prompt"]
+    assert "Dani role policy:" in prompt
+    assert "- Role: reviewer" in prompt
+    session = service.storage.list_sessions()[0]
+    assert session.effective_runtime == RUNTIME_GJC
+    assert session.native_session_runtime == RUNTIME_GJC
+    assert session.omx_session_id == f"gjc-{job.id}"
+def test_gjc_runtime_failure_does_not_fallback_to_omx(tmp_path: Path) -> None:
+    service, _, gjc_runner = make_gjc_bound_service(tmp_path)
+    gjc_runner.queue_wait_error(RuntimeError("gjc boom"))
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=73,
+            actor_login="human",
+            payload={},
+            body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.get_job(result["job_id"])
+    assert job is not None
+    assert job.status == "failed"
+    assert job.metadata["effective_runtime"] == RUNTIME_GJC
+    assert "fallback_reason" not in job.metadata
+    assert cast(FakeRuntimeRunner, service.omx_runner).launches == []
+
+
 
 
 def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Path) -> None:
