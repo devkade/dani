@@ -2,7 +2,7 @@ from dani.models import NormalizedEvent
 from dani.routing import ROLE_PLANNER, ROLE_REVIEWER, ROLE_WORKER, parse_role_bindings, route_event
 
 
-def test_route_issue_opened_to_reviewer_readiness_review() -> None:
+def test_route_issue_opened_to_planner_issue_request() -> None:
     event = NormalizedEvent(
         kind="issue_opened",
         repo_full_name="acme/demo",
@@ -16,8 +16,8 @@ def test_route_issue_opened_to_reviewer_readiness_review() -> None:
     decision = route_event(event)
 
     assert decision is not None
-    assert decision.role == ROLE_REVIEWER
-    assert decision.stage == "issue_readiness_review"
+    assert decision.role == ROLE_PLANNER
+    assert decision.stage == "issue_request"
     assert decision.reason == "issue_opened"
     assert decision.target_metadata == {
         "event_kind": "issue_opened",
@@ -29,7 +29,7 @@ def test_route_issue_opened_to_reviewer_readiness_review() -> None:
     }
 
 
-def test_route_non_approve_issue_comment_to_reviewer_readiness_review() -> None:
+def test_route_non_approve_issue_comment_to_planner_followup() -> None:
     event = NormalizedEvent(
         kind="issue_comment",
         repo_full_name="acme/demo",
@@ -43,8 +43,8 @@ def test_route_non_approve_issue_comment_to_reviewer_readiness_review() -> None:
     decision = route_event(event, is_approve_comment=False)
 
     assert decision is not None
-    assert decision.role == ROLE_REVIEWER
-    assert decision.stage == "issue_readiness_review"
+    assert decision.role == ROLE_PLANNER
+    assert decision.stage == "issue_followup"
     assert decision.reason == "issue_comment_non_approve"
     assert decision.target_metadata["issue_number"] == 4
 

@@ -224,7 +224,10 @@ class DaniService:
             if "pull_request" in issue:
                 continue
             latest_signature = self.github.latest_signature_comment(repo_full_name, issue["number"], kind="issue")
-            if latest_signature is not None and latest_signature[1].get("stage") == ISSUE_READINESS_REVIEW_STAGE:
+            if latest_signature is not None and latest_signature[1].get("stage") in {
+                "issue_request",
+                ISSUE_READINESS_REVIEW_STAGE,
+            }:
                 continue
             event = NormalizedEvent(
                 kind="issue_opened",
@@ -328,7 +331,7 @@ class DaniService:
             return {"status": "ignored", "reason": "issue_closed"}
         if self.storage.is_terminal_issue(repo.full_name, event.number):
             return {"status": "ignored", "reason": "issue_terminal"}
-        return self._queue_issue_readiness_review(repo, event)
+        return self._queue_issue_request(repo, event)
 
     def _dispatch_approve_comment(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
         if event.issue_state == "closed":
@@ -404,7 +407,7 @@ class DaniService:
             return {"status": "ignored", "reason": "self_authored_comment"}
         if self._completed_followup_count(repo.full_name, event.number) >= self.config.max_issue_followups:
             return {"status": "ignored", "reason": "max_followups_reached"}
-        return self._queue_issue_readiness_review(repo, event)
+        return self._queue_issue_followup(repo, event)
 
     def _issue_readiness(self, repo_full_name: str, issue_number: int) -> str:
         latest = self.github.latest_signature_comment(repo_full_name, issue_number, kind="issue")
@@ -634,7 +637,7 @@ class DaniService:
 
         if event.kind == "issue_comment" and self._signature_requests_refinement(signature):
             return self._handle_issue_refinement_request(event, signature)
-        if stage == "issue_followup" and event.kind == "issue_comment":
+        if stage in {"issue_request", "issue_followup"} and event.kind == "issue_comment":
             return self._handle_planner_refinement_event(event, signature)
         if stage == ISSUE_READINESS_REVIEW_STAGE and event.kind == "issue_comment":
             return self._handle_issue_readiness_event(event, signature)
