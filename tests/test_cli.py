@@ -108,6 +108,7 @@ def test_build_config_defaults_for_bot_login_and_max_issue_followups(tmp_path: P
 
     assert config.bot_login is None
     assert config.max_issue_followups == 3
+    assert config.issue_ready_launch == "manual"
 
 
 def test_build_config_reads_bot_login_from_env(tmp_path: Path, monkeypatch) -> None:
@@ -161,6 +162,35 @@ def test_build_config_reads_max_issue_followups_from_config_file(tmp_path: Path,
     config = cli_module.build_config(data_dir)
 
     assert config.max_issue_followups == 7
+
+def test_build_config_reads_issue_ready_launch_from_config_file(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"issue_ready_launch": "auto"}), encoding="utf-8")
+    monkeypatch.delenv("DANI_ISSUE_READY_LAUNCH", raising=False)
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.issue_ready_launch == "auto"
+
+
+def test_build_config_reads_issue_ready_launch_from_env(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    monkeypatch.setenv("DANI_ISSUE_READY_LAUNCH", "auto-launch")
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.issue_ready_launch == "auto"
+
+
+def test_build_config_rejects_unknown_issue_ready_launch(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    monkeypatch.setenv("DANI_ISSUE_READY_LAUNCH", "surprise")
+
+    with pytest.raises(cli_module.typer.BadParameter):
+        cli_module.build_config(data_dir)
 
 
 def test_build_config_reads_repo_concurrency_from_env(tmp_path: Path, monkeypatch) -> None:

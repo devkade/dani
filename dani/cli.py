@@ -5,6 +5,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
+from typing import Any, cast
 
 import typer
 import uvicorn
@@ -21,7 +22,13 @@ from dani.doctor import (
     run_doctor,
     validate_output_path,
 )
-from dani.models import DEFAULT_AGENT_TIMEOUT_SECONDS, DEFAULT_MAX_ISSUE_FOLLOWUPS, DaniConfig
+from dani.models import (
+    DEFAULT_AGENT_TIMEOUT_SECONDS,
+    DEFAULT_MAX_ISSUE_FOLLOWUPS,
+    ISSUE_READY_LAUNCH_MANUAL,
+    ISSUE_READY_LAUNCH_MODES,
+    DaniConfig,
+)
 from dani.server import create_app
 from dani.service import DaniService
 
@@ -121,6 +128,27 @@ def _resolve_repo_concurrency(config_payload: dict[str, object]) -> int:
         value = env_value
     return _parse_positive_int(value, name="repo_concurrency")
 
+def _resolve_issue_ready_launch(config_payload: dict[str, object]) -> str:
+    value = os.environ.get("DANI_ISSUE_READY_LAUNCH") or config_payload.get(
+        "issue_ready_launch", ISSUE_READY_LAUNCH_MANUAL
+    )
+    launch = str(value).strip().casefold().replace("-", "_")
+    aliases = {
+        "manual_approve": ISSUE_READY_LAUNCH_MANUAL,
+        "manual": ISSUE_READY_LAUNCH_MANUAL,
+        "approve": ISSUE_READY_LAUNCH_MANUAL,
+        "auto_launch": "auto",
+        "automatic": "auto",
+        "auto": "auto",
+    }
+    launch = aliases.get(launch, launch)
+    if launch not in ISSUE_READY_LAUNCH_MODES:
+        allowed = ", ".join(sorted(ISSUE_READY_LAUNCH_MODES))
+        msg = f"issue_ready_launch must be one of: {allowed}"
+        raise typer.BadParameter(msg)
+    return launch
+
+
 
 def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> DaniConfig:
     config_payload = _load_config_file(data_dir)
@@ -130,6 +158,11 @@ def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> D
     bot_login = _resolve_bot_login(config_payload)
     max_issue_followups = _resolve_max_issue_followups(config_payload)
     repo_concurrency = _resolve_repo_concurrency(config_payload)
+    issue_ready_launch = _resolve_issue_ready_launch(config_payload)
+    role_bindings = config_payload.get("role_bindings", {})
+    if not isinstance(role_bindings, dict):
+        role_bindings = {}
+    typed_role_bindings = cast(dict[str, Any], role_bindings)
     return DaniConfig(
         data_dir=data_dir,
         webhook_secret=secret,
@@ -140,6 +173,8 @@ def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> D
         bot_login=bot_login,
         max_issue_followups=max_issue_followups,
         repo_concurrency=repo_concurrency,
+        role_bindings=typed_role_bindings,
+        issue_ready_launch=issue_ready_launch,
     )
 
 

@@ -14,6 +14,11 @@ from dani.models import JobRecord
 from dani.omx_runner import OmxRunner
 from dani.signatures import build_signature
 
+_CLOSE_SESSION_SHOULD_SIGNAL_PROCESS_GROUP = "close_session should signal the process group"
+_PROCESS_KILL_SHOULD_NOT_BE_NEEDED = "process kill should not be needed"
+_PARENT_PROCESS_ALREADY_EXITED = "parent process already exited"
+_CLOSE_SESSION_SHOULD_NOT_WAIT_FOR_EXITED_PARENT = "close_session should not wait for an exited parent"
+
 
 def _git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ | {
@@ -121,13 +126,13 @@ def test_close_session_signals_process_group_when_available(tmp_path: Path, monk
             return None
 
         def terminate(self):
-            raise AssertionError("close_session should signal the process group")
+            raise AssertionError(_CLOSE_SESSION_SHOULD_SIGNAL_PROCESS_GROUP)
 
         def wait(self, timeout=None):
             return 0
 
         def kill(self):
-            raise AssertionError("process kill should not be needed")
+            raise AssertionError(_PROCESS_KILL_SHOULD_NOT_BE_NEEDED)
 
     monkeypatch.setattr("dani.omx_runner.os.getpgid", lambda pid: 4321)
     monkeypatch.setattr("dani.omx_runner.os.killpg", lambda pgid, sig: sent_signals.append((pgid, sig)))
@@ -162,13 +167,13 @@ def test_close_session_signals_remembered_group_after_parent_exits(
             return 0
 
         def terminate(self):
-            raise AssertionError("parent process already exited")
+            raise AssertionError(_PARENT_PROCESS_ALREADY_EXITED)
 
         def wait(self, timeout=None):
-            raise AssertionError("close_session should not wait for an exited parent")
+            raise AssertionError(_CLOSE_SESSION_SHOULD_NOT_WAIT_FOR_EXITED_PARENT)
 
         def kill(self):
-            raise AssertionError("process kill should not be needed")
+            raise AssertionError(_PROCESS_KILL_SHOULD_NOT_BE_NEEDED)
 
     monkeypatch.setattr("dani.omx_runner.os.killpg", lambda pgid, sig: sent_signals.append((pgid, sig)))
     runner._processes["runtime-123"] = (Process(), stdout_file, stderr_file)

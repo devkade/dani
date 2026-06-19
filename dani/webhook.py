@@ -158,6 +158,37 @@ def _normalize_pull_request_review_comment(
     )
 
 
+def _normalize_check_status(
+    payload: dict[str, Any], *, repo_full_name: str, action: str, delivery_id: str | None
+) -> NormalizedEvent | None:
+    check = payload.get("check_run") or payload.get("check_suite") or payload
+    pull_requests = check.get("pull_requests") if isinstance(check, dict) else None
+    if not isinstance(pull_requests, list) or not pull_requests:
+        return None
+    first_pr = pull_requests[0]
+    if not isinstance(first_pr, dict):
+        return None
+    number = first_pr.get("number")
+    if not isinstance(number, int):
+        return None
+    head_sha = check.get("head_sha") or payload.get("sha") if isinstance(check, dict) else payload.get("sha")
+    return NormalizedEvent(
+        kind="check_status",
+        repo_full_name=repo_full_name,
+        action=action or str(payload.get("state") or "updated"),
+        number=number,
+        actor_login=payload.get("sender", {}).get("login", ""),
+        payload=payload,
+        body=str(check.get("name") or check.get("context") or ""),
+        title=str(check.get("name") or check.get("context") or f"PR #{number}"),
+        delivery_id=delivery_id,
+        commit_sha=head_sha if isinstance(head_sha, str) else None,
+        is_pull_request=True,
+        pr_state="open",
+        actor_type=_actor_type(payload),
+    )
+
+
 _PULL_REQUEST_OPEN_ACTIONS = frozenset({
     "opened",
     "synchronize",
@@ -203,6 +234,8 @@ def normalize_event(
         return _normalize_pull_request_review_comment(
             payload, repo_full_name=repo_full_name, action=action, delivery_id=delivery_id
         )
+    if event_name in {"check_run", "check_suite", "status"}:
+        return _normalize_check_status(payload, repo_full_name=repo_full_name, action=action, delivery_id=delivery_id)
 
     return None
 

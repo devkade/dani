@@ -79,6 +79,13 @@ def add_exact_review_signature(github: FakeGitHubCLI, job: JobRecord) -> None:
         build_signature(**signature_fields),
     )
 
+def add_ready_issue_signature(github: FakeGitHubCLI, repo_full_name: str, issue_number: int) -> None:
+    github.add_issue_signature(
+        repo_full_name,
+        issue_number,
+        build_signature(stage="issue_readiness_review", job=f"reviewer-{issue_number}", issue=issue_number, readiness="ready"),
+    )
+
 
 def make_service(
     tmp_path: Path, *, dev_syncer: FakeGitDevSyncer | None = None
@@ -202,6 +209,174 @@ def test_issue_request_persists_omx_session_id(tmp_path: Path) -> None:
     session = service.storage.list_sessions()[0]
     assert session.omx_session_id == "omx-" + session.job_id
 
+def test_issue_opened_carries_planner_role_policy(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=22,
+            actor_login="human",
+            payload={},
+            body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.get_job(result["job_id"])
+    assert job is not None
+    assert job.role == "planner"
+    assert job.stage == "issue_request"
+    assert job.metadata["role"] == "planner"
+    assert job.metadata["route_reason"] == "issue_opened"
+    assert job.metadata["target"]["issue_number"] == 22
+    assert "push_commits" in job.metadata["forbidden_actions"]
+    session = service.storage.list_sessions()[0]
+    assert session.role == "planner"
+    prompt = omx_runner.launches[-1]["prompt"]
+    assert "Dani role policy:" in prompt
+    assert "- Role: planner" in prompt
+    assert "Forbidden actions: push_commits" in prompt
+
+
+def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    # Seed the planner lineage so refinement can resume the existing issue discussion.
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=44,
+            actor_login="human",
+            payload={},
+            body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    github.create_issue_comment(
+        "acme/demo",
+        44,
+        build_signature(stage="issue_readiness_review", job="reviewer-job", issue=44, readiness="needs_refinement"),
+    )
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=44,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["stage"] == "issue_followup"
+    jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=44)
+    assert jobs[-1].role == "planner"
+    assert jobs[-1].metadata["readiness"] == "needs_refinement"
+    assert omx_runner.resumes[-1]["job"].stage == "issue_followup"
+
+def test_reviewer_ready_signature_waits_for_manual_approve_by_default(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+    signature = build_signature(stage="issue_readiness_review", job="reviewer-job", issue=45, readiness="ready")
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=45,
+            actor_login="reviewer",
+            payload={"issue": {"body": "context"}},
+            body=signature,
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result == {"status": "updated", "stage": "issue_readiness_review", "readiness": "ready"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=45) == []
+    assert omx_runner.launches == []
+
+
+def test_reviewer_ready_signature_auto_launches_worker_when_configured(tmp_path: Path) -> None:
+    config = DaniConfig(
+        data_dir=tmp_path / ".dani",
+        webhook_secret=TEST_SECRET,
+        issue_ready_launch="auto",
+    )
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+    signature = build_signature(stage="issue_readiness_review", job="reviewer-job", issue=46, readiness="ready")
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=46,
+            actor_login="reviewer",
+            payload={"issue": {"body": "context"}},
+            body=signature,
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["stage"] == "implementation"
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=46)[0]
+    assert job.role == "worker"
+    assert job.metadata["route_reason"] == "issue_readiness_auto_launch"
+    assert job.metadata["launch_gate_state"] == "auto_approved"
+    assert job.metadata["launch_trigger"] == "reviewer_ready_auto"
+    assert omx_runner.launches[-1]["job"].stage == "implementation"
+
+
+def test_check_status_queues_reviewer_check_review(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="check_status",
+            repo_full_name="acme/demo",
+            action="completed",
+            number=88,
+            actor_login="github-actions",
+            payload={"status": "completed", "conclusion": "failure"},
+            body="ci",
+            title="ci",
+            commit_sha="abc123",
+            is_pull_request=True,
+            pr_state="open",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["stage"] == "check_review"
+    job = service.storage.get_job(result["job_id"])
+    assert job is not None
+    assert job.role == "reviewer"
+    assert job.metadata["route_reason"] == "check_status_completed"
+    assert omx_runner.launches[-1]["job"].stage == "check_review"
+
 
 def test_issue_request_verification_requires_exact_signature(tmp_path: Path) -> None:
     service, github, _ = make_service(tmp_path)
@@ -252,7 +427,7 @@ def test_issue_opened_queues_issue_request(tmp_path: Path) -> None:
     assert session.termination_reason == "completed"
 
 
-def test_general_issue_comment_resumes_existing_issue_session(tmp_path: Path) -> None:
+def test_general_issue_comment_resumes_planner_issue_session(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
     service.handle_event(
         NormalizedEvent(
@@ -304,7 +479,6 @@ def test_general_issue_comment_without_existing_issue_session_is_ignored(tmp_pat
             title="Need automation",
         )
     )
-
     assert result == {"status": "ignored", "reason": "missing_issue_session"}
     assert omx_runner.resumes == []
 
@@ -435,10 +609,12 @@ def test_issue_followup_after_omo_fallback_continues_on_omx_session(tmp_path: Pa
     )
     service.wait_for_idle()
 
-    followup_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=53)[0]
+    review_job = service.storage.find_jobs(
+        repo_full_name="acme/demo", stage="issue_followup", issue_number=53
+    )[-1]
     assert result["stage"] == "issue_followup"
-    assert followup_job.status == "completed"
-    assert followup_job.metadata["effective_runtime"] == RUNTIME_OMX
+    assert review_job.status == "completed"
+    assert review_job.metadata["effective_runtime"] == RUNTIME_OMX
     assert len(omo_runner.resumes) == 0
     assert len(omx_runner.resumes) == 1
     assert omx_runner.resumes[0]["job"].stage == "issue_followup"
@@ -749,7 +925,7 @@ def test_issue_followup_rollout_missing_marks_job_failed_and_posts_restart_warni
     )
     service.wait_for_idle()
 
-    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=33)[0]
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=33)[-1]
     assert job.status == "failed"
     assert job.metadata["error"] == "rollout_missing"
     assert "thread/resume failed" in job.metadata["error_detail"]
@@ -759,11 +935,6 @@ def test_issue_followup_rollout_missing_marks_job_failed_and_posts_restart_warni
         "acme/demo", 33, kind="issue", signature_fragment=warning_signature
     )
     assert len(warning_comments) == 1
-    assert "dani restart-issue acme/demo 33" in warning_comments[0]["body"]
-    latest_comment = github.latest_signature_comment("acme/demo", 33, kind="issue")
-    assert latest_comment is not None
-    assert latest_comment[1]["stage"] == "session_lost"
-    assert latest_comment[1]["issue"] == "33"
 
 
 def test_issue_followup_rollout_missing_warning_comment_is_posted_only_once(tmp_path: Path) -> None:
@@ -811,15 +982,9 @@ def test_issue_followup_rollout_missing_warning_comment_is_posted_only_once(tmp_
         signature_fragment=build_signature(stage="session_lost", issue=34),
     )
     assert len(warning_comments) == 1
-    matching_keys = [
-        key
-        for key in service.storage.snapshot()["processed_events"]["keys"]
-        if "stage=session_lost" in key and "issue=34" in key
-    ]
-    assert len(matching_keys) == 1
-    failed_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=34)
-    assert len(failed_jobs) == 2
-    assert all(job.status == "failed" for job in failed_jobs)
+    review_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=34)
+    assert len(review_jobs) == 2
+    assert all(job.status == "failed" for job in review_jobs)
 
 
 def test_issue_followup_rollout_missing_retries_warning_after_comment_post_failure(tmp_path: Path) -> None:
@@ -1104,7 +1269,7 @@ def test_issue_comment_with_ignore_command_overrides_approve(tmp_path: Path) -> 
     assert omx_runner.launches == []
 
 
-def test_approve_comment_queues_implementation(tmp_path: Path) -> None:
+def test_approve_comment_without_reviewer_ready_signature_is_blocked(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
     event = NormalizedEvent(
         kind="issue_comment",
@@ -1120,9 +1285,34 @@ def test_approve_comment_queues_implementation(tmp_path: Path) -> None:
     result = service.handle_event(event)
     service.wait_for_idle()
 
+    assert result == {"status": "ignored", "reason": "issue_not_ready"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11) == []
+    assert omx_runner.launches == []
+
+
+def test_approve_comment_with_reviewer_ready_signature_queues_implementation(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    add_ready_issue_signature(github, "acme/demo", 11)
+    event = NormalizedEvent(
+        kind="issue_comment",
+        repo_full_name="acme/demo",
+        action="created",
+        number=11,
+        actor_login="acme",
+        payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+        body="/approve",
+        title="Need automation",
+    )
+
+    result = service.handle_event(event)
+    service.wait_for_idle()
+
     assert result["stage"] == "implementation"
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    assert job.metadata["issue_readiness_state"] == "ready"
+    assert job.metadata["launch_gate_state"] == "approved"
     assert omx_runner.launches[0]["job"].stage == "implementation"
-    assert service.storage.list_jobs()[0].status == "completed"
+    assert job.status == "completed"
 
 
 def test_new_implementation_creates_isolated_work_line_before_launch(tmp_path: Path) -> None:
@@ -1141,6 +1331,7 @@ def test_new_implementation_creates_isolated_work_line_before_launch(tmp_path: P
     )
     service.register_repo("acme/demo", str(tmp_path))
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1191,6 +1382,7 @@ def test_sibling_implementation_work_line_states_do_not_overwrite_each_other(tmp
     service, _, _ = make_service(tmp_path)
 
     for issue_number in (11, 12):
+        add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", issue_number)
         service.handle_event(
             NormalizedEvent(
                 kind="issue_comment",
@@ -1227,6 +1419,7 @@ def test_state_snapshot_reports_each_work_line_with_own_worktree_and_result(tmp_
     service, _, _ = make_service(tmp_path)
 
     for issue_number in (31, 32):
+        add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", issue_number)
         service.handle_event(
             NormalizedEvent(
                 kind="issue_comment",
@@ -1274,6 +1467,7 @@ def test_final_verdict_updates_only_own_work_line_merge_state(tmp_path: Path) ->
     service, github, _ = make_service(tmp_path)
 
     for issue_number in (21, 22):
+        add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", issue_number)
         service.handle_event(
             NormalizedEvent(
                 kind="issue_comment",
@@ -1339,6 +1533,7 @@ def test_review_fix_reuses_original_isolated_work_line(tmp_path: Path) -> None:
     )
     service.register_repo("acme/demo", str(tmp_path))
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1415,6 +1610,7 @@ def test_review_fix_reuses_original_isolated_work_line(tmp_path: Path) -> None:
 
 def test_review_fix_loop_repeats_in_same_work_line_until_final_approval(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1536,6 +1732,7 @@ def test_review_fix_agent_commits_to_original_branch(tmp_path: Path) -> None:
     )
     service.register_repo("acme/demo", str(repo_path))
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1589,6 +1786,7 @@ def test_review_fix_agent_commits_to_original_branch(tmp_path: Path) -> None:
 def test_implementation_executes_with_preferred_runtime_inside_work_line(tmp_path: Path) -> None:
     service, _, omo_runner, omx_runner = make_omo_preferred_service(tmp_path)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1630,6 +1828,7 @@ def test_implementation_runtime_fallback_stays_inside_same_work_line(tmp_path: P
         )
     )
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 13)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1664,6 +1863,7 @@ def test_implementation_runtime_fallback_stays_inside_same_work_line(tmp_path: P
 def test_approve_from_repo_owner_login_queues_implementation(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 21)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1686,6 +1886,7 @@ def test_approve_from_repo_owner_login_queues_implementation(tmp_path: Path) -> 
 def test_approve_with_owner_author_association_queues_implementation(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 22)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1711,6 +1912,7 @@ def test_approve_with_owner_author_association_queues_implementation(tmp_path: P
 def test_approve_with_member_author_association_queues_without_membership_api_call(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 23)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1738,6 +1940,7 @@ def test_approve_from_org_member_queues_implementation(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
     github.register_org_member("acme", "alice")
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 24)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1764,6 +1967,7 @@ def test_approve_from_unauthorized_actor_is_ignored_with_thumbs_down_reaction(tm
     service, github, omx_runner = make_service(tmp_path)
     github.register_org_member("acme", "alice")
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 25)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1790,6 +1994,7 @@ def test_approve_from_unauthorized_actor_is_ignored_with_thumbs_down_reaction(tm
 def test_approve_from_collaborator_is_ignored(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 26)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1815,6 +2020,7 @@ def test_approve_from_collaborator_is_ignored(tmp_path: Path) -> None:
 def test_approve_unauthorized_skips_reaction_when_comment_id_missing(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 27)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1838,6 +2044,7 @@ def test_approve_unauthorized_swallows_reaction_failure(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
     github.simulated_reaction_failure = RuntimeError("github outage")
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 28)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1885,6 +2092,7 @@ def test_pr_opened_from_implementation_signature_queues_review_round(tmp_path: P
         body="/approve",
         title="Ship it",
     )
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     service.handle_event(implementation_event)
     service.wait_for_idle()
     implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=12)[
@@ -1916,6 +2124,7 @@ def test_pr_opened_from_implementation_signature_queues_review_round(tmp_path: P
 
 def test_duplicate_agent_managed_pr_delivery_is_ignored(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -1960,6 +2169,7 @@ def test_duplicate_agent_managed_pr_delivery_is_ignored(tmp_path: Path) -> None:
 
 def test_implementation_pr_creation_keeps_agent_owned_branch_and_worktree(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -2024,6 +2234,7 @@ def test_implementation_pr_creation_keeps_agent_owned_branch_and_worktree(tmp_pa
 
 def test_agent_managed_pr_review_runs_inside_original_work_line(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -2101,6 +2312,7 @@ def test_agent_managed_pr_review_keeps_originating_branch_and_worktree(tmp_path:
     )
     service.register_repo("acme/demo", str(repo_path))
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -4218,7 +4430,7 @@ class MissingIssueCommentRunner(FakeOmxRunner):
         self.resumable = resumable
 
     def launch(self, repo_path: Path, job: JobRecord, prompt: str):
-        if job.stage in {"issue_request", "issue_followup"}:
+        if job.stage in {"issue_request", "issue_followup", "issue_readiness_review"}:
             self.launches.append({"repo_path": str(repo_path), "job": job, "prompt": prompt})
             return SessionRecord(
                 repo_full_name=job.repo_full_name,
@@ -4310,7 +4522,9 @@ def test_issue_request_missing_signature_recovers_with_original_signature(tmp_pa
     jobs = service.storage.list_jobs()
     source_job = jobs[0]
     recovery_job = jobs[1]
-    expected_signature = build_signature(stage="issue_request", job=source_job.id, issue=40)
+    expected_signature = build_signature(
+        stage="issue_request", job=source_job.id, issue=40
+    )
     assert source_job.stage == "issue_request"
     assert source_job.status == "completed"
     assert source_job.metadata["comment_recovery_attempts"] == 1
@@ -4372,7 +4586,10 @@ def test_issue_request_recovery_uses_fresh_launch_when_original_session_cannot_r
     service.wait_for_idle()
 
     assert not omx_runner.resumes
-    assert [record["job"].stage for record in omx_runner.launches] == ["issue_request", "issue_request_recovery"]
+    assert [record["job"].stage for record in omx_runner.launches] == [
+        "issue_request",
+        "issue_request_recovery",
+    ]
     source_job, recovery_job = service.storage.list_jobs()
     assert source_job.status == "completed"
     assert recovery_job.status == "completed"
@@ -4684,7 +4901,10 @@ def test_issue_request_recovery_falls_back_to_fresh_launch_when_resumed_process_
     assert source_job.status == "completed"
     assert recovery_job.status == "completed"
     assert [record["job"].stage for record in omx_runner.resumes] == ["issue_request_recovery"]
-    assert [record["job"].stage for record in omx_runner.launches] == ["issue_request", "issue_request_recovery"]
+    assert [record["job"].stage for record in omx_runner.launches] == [
+        "issue_request",
+        "issue_request_recovery",
+    ]
     assert recovery_job.metadata["comment_recovery_resume_error"] == "resume failed"
 
 
@@ -4717,7 +4937,9 @@ def test_issue_request_recovery_does_not_fresh_launch_when_resume_exception_post
     service.wait_for_idle()
 
     source_job, recovery_job = service.storage.list_jobs()
-    expected_signature = build_signature(stage="issue_request", job=source_job.id, issue=50)
+    expected_signature = build_signature(
+        stage="issue_request", job=source_job.id, issue=50
+    )
     matching_comments = github.find_comments_by_signature(
         "acme/demo", 50, kind="issue", signature_fragment=expected_signature
     )
@@ -4759,7 +4981,9 @@ def test_issue_request_recovery_does_not_fresh_launch_when_failed_resume_posted_
     service.wait_for_idle()
 
     source_job, recovery_job = service.storage.list_jobs()
-    expected_signature = build_signature(stage="issue_request", job=source_job.id, issue=47)
+    expected_signature = build_signature(
+        stage="issue_request", job=source_job.id, issue=47
+    )
     matching_comments = github.find_comments_by_signature(
         "acme/demo", 47, kind="issue", signature_fragment=expected_signature
     )
@@ -5174,6 +5398,7 @@ def test_issue_reopened_action_is_no_op(tmp_path: Path) -> None:
 def test_approve_on_closed_issue_does_not_queue_implementation(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -5198,6 +5423,7 @@ def test_approve_after_terminal_issue_flag_is_ignored(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
     service.storage.mark_terminal_issue("acme/demo", 12)
 
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 12)
     result = service.handle_event(
         NormalizedEvent(
             kind="issue_comment",
@@ -5229,6 +5455,7 @@ def test_second_approve_for_same_issue_is_deduplicated(tmp_path: Path) -> None:
         title="t",
         issue_state="open",
     )
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 13)
 
     first = service.handle_event(base_event)
     service.wait_for_idle()

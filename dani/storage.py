@@ -16,6 +16,18 @@ from dani.models import (
 )
 
 
+def _job_from_dict(item: dict[str, Any]) -> JobRecord:
+    payload = dict(item)
+    payload.setdefault("role", None)
+    return JobRecord(**payload)
+
+
+def _session_from_dict(item: dict[str, Any]) -> SessionRecord:
+    payload = dict(item)
+    payload.setdefault("role", None)
+    return SessionRecord(**payload)
+
+
 class JsonStorage:
     def __init__(self, config: DaniConfig) -> None:
         self.config = config
@@ -84,7 +96,7 @@ class JsonStorage:
                 item.update(changes)
                 item["updated_at"] = utc_now()
                 self._write_json(self.config.jobs_path, payload)
-                return JobRecord(**item)
+                return _job_from_dict(item)
         msg = f"Unknown job id: {job_id}"
         raise KeyError(msg)
 
@@ -93,13 +105,13 @@ class JsonStorage:
             payload = self._read_json(self.config.jobs_path)
             for item in payload["jobs"]:
                 if item["id"] == job_id:
-                    return JobRecord(**item)
+                    return _job_from_dict(item)
         return None
 
     def list_jobs(self) -> list[JobRecord]:
         with self._lock:
             payload = self._read_json(self.config.jobs_path)
-            return [JobRecord(**item) for item in payload["jobs"]]
+            return [_job_from_dict(item) for item in payload["jobs"]]
 
     def find_jobs(
         self,
@@ -139,14 +151,14 @@ class JsonStorage:
                 item.update(changes)
                 item["updated_at"] = utc_now()
                 self._write_json(self.config.sessions_path, payload)
-                return SessionRecord(**item)
+                return _session_from_dict(item)
         msg = f"Unknown session id: {session_id}"
         raise KeyError(msg)
 
     def list_sessions(self) -> list[SessionRecord]:
         with self._lock:
             payload = self._read_json(self.config.sessions_path)
-            return [SessionRecord(**item) for item in payload["sessions"]]
+            return [_session_from_dict(item) for item in payload["sessions"]]
 
     def upsert_work_line(self, work_line: WorkLineRecord) -> WorkLineRecord:
         with self._lock:

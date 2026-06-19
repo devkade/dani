@@ -235,19 +235,27 @@ class FakeOmxRunner:
             script_path=str(repo_path / "run.sh"),
             worktree_path=str(repo_path),
             job_id=job.id,
+            role=job.role,
             issue_number=job.issue_number,
             pr_number=job.pr_number,
             review_round=job.review_round,
             omx_session_id=f"omx-{job.id}",
         )
 
-    def _post_side_effect(self, repo_full_name: str, job: JobRecord, signature: dict[str, str] | None) -> None:
+    def _post_side_effect(self, repo_full_name: str, job: JobRecord, signature: dict[str, str] | None) -> None:  # noqa: C901
         if job.stage == "issue_request":
             issue_number = int((signature or {}).get("issue", job.issue_number or 0))
             self.github.add_issue_signature(
                 repo_full_name,
                 issue_number,
                 build_signature(stage="issue_request", job=job.id, issue=issue_number),
+            )
+        elif job.stage == "issue_readiness_review":
+            issue_number = int((signature or {}).get("issue", job.issue_number or 0))
+            self.github.add_issue_signature(
+                repo_full_name,
+                issue_number,
+                build_signature(stage="issue_readiness_review", job=job.id, issue=issue_number, readiness="ready"),
             )
         elif job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
             self._post_recovery_side_effect(repo_full_name, job)
@@ -270,12 +278,12 @@ class FakeOmxRunner:
                     title=f"Feature/#{issue_number}",
                     head_branch=str(job.metadata.get("branch_name") or f"feature/#{issue_number}"),
                 )
-        elif job.stage == "review_round":
+        elif job.stage in {"review_round", "check_review"}:
             pr_number = int((signature or {}).get("pr", job.pr_number or 0))
             self.github.add_pr_signature(
                 repo_full_name,
                 pr_number,
-                build_signature(stage="review_round", job=job.id, pr=pr_number, round=job.review_round or 1),
+                build_signature(stage=job.stage, job=job.id, pr=pr_number, round=job.review_round or 1),
             )
         elif job.stage == "merge_conflict_resolution":
             pr_number = int((signature or {}).get("pr", job.pr_number or 0))
@@ -319,6 +327,7 @@ class FakeOmxRunner:
             script_path=str(repo_path / "run.sh"),
             worktree_path=str(repo_path),
             job_id=job.id,
+            role=job.role,
             issue_number=job.issue_number,
             pr_number=job.pr_number,
             review_round=job.review_round,
@@ -375,6 +384,7 @@ class FakeRuntimeRunner(FakeOmxRunner):
             script_path=str(repo_path / "run.sh"),
             worktree_path=str(repo_path),
             job_id=job.id,
+            role=job.role,
             issue_number=job.issue_number,
             pr_number=job.pr_number,
             review_round=job.review_round,
@@ -404,6 +414,7 @@ class FakeRuntimeRunner(FakeOmxRunner):
             script_path=str(repo_path / "run.sh"),
             worktree_path=str(repo_path),
             job_id=job.id,
+            role=job.role,
             issue_number=job.issue_number,
             pr_number=job.pr_number,
             review_round=job.review_round,
