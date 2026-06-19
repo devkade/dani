@@ -156,7 +156,7 @@ def parse_role_bindings(raw: object, *, agent_runtime: str) -> dict[str, AgentRo
 def route_event(event: NormalizedEvent, *, is_approve_comment: bool = False) -> RouteDecision | None:
     target = _target_metadata(event)
     if event.kind == "issue_opened":
-        return RouteDecision(ROLE_PLANNER, "issue_request", "issue_opened", target)
+        return RouteDecision(ROLE_REVIEWER, "issue_readiness_review", "issue_opened", target)
     if event.kind == "issue_comment" and is_approve_comment:
         return RouteDecision(ROLE_WORKER, "implementation", "issue_comment_approve", target)
     if event.kind == "issue_comment":

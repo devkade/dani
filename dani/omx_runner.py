@@ -62,7 +62,7 @@ class OmxRunner:
             self._processes[process_handle] = (process, stdout_file, stderr_file)
             self._remember_process_group(process_handle, process)
         omx_session_id = None
-        if job.stage in {"issue_request", "issue_followup"}:
+        if job.stage in {"issue_request", "issue_followup", "issue_readiness_review"}:
             omx_session_id = self._capture_omx_session_id(repo_path=repo_path, prompt=prompt, started_at=started_at)
         return SessionRecord(
             repo_full_name=job.repo_full_name,
