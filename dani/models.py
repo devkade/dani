@@ -143,6 +143,9 @@ class NormalizedEvent:
 
 
 DEFAULT_MAX_ISSUE_FOLLOWUPS = 3
+ISSUE_READY_LAUNCH_MANUAL = "manual"
+ISSUE_READY_LAUNCH_AUTO = "auto"
+ISSUE_READY_LAUNCH_MODES = frozenset({ISSUE_READY_LAUNCH_MANUAL, ISSUE_READY_LAUNCH_AUTO})
 
 
 @dataclass(slots=True)
@@ -158,6 +161,7 @@ class DaniConfig:
     bot_login: str | None = None
     max_issue_followups: int = DEFAULT_MAX_ISSUE_FOLLOWUPS
     repo_concurrency: int = 1
+    issue_ready_launch: str = ISSUE_READY_LAUNCH_MANUAL
 
     @property
     def config_path(self) -> Path:

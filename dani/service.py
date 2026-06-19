@@ -21,6 +21,7 @@ from dani.errors import (
 from dani.git_sync import DevSyncConflictError, GitDevSyncer
 from dani.github import GitHubCLI, MergeConflictError
 from dani.models import (
+    ISSUE_READY_LAUNCH_AUTO,
     RUNTIME_OMO,
     RUNTIME_OMX,
     DaniConfig,
@@ -413,13 +414,7 @@ class DaniService:
         stage = str(signature.get("stage") or "")
         if stage != ISSUE_READINESS_REVIEW_STAGE:
             return "missing"
-        raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
-        value = str(raw or "").strip().casefold().replace("-", "_")
-        if value in {"ready", "approved", "approve", "ok"}:
-            return "ready"
-        if value in {"not_ready", "needs_refinement", "refine", "changes_requested"}:
-            return "needs_refinement" if value != "not_ready" else "not_ready"
-        return "missing"
+        return self._readiness_from_signature(signature)
 
     def _signature_requests_refinement(self, signature: dict[str, str]) -> bool:
         stage = str(signature.get("stage") or "")
@@ -428,6 +423,18 @@ class DaniService:
         raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
         value = str(raw or "").strip().casefold().replace("-", "_")
         return value in {"not_ready", "needs_refinement", "refine", "changes_requested"}
+
+    def _readiness_from_signature(self, signature: dict[str, str]) -> str:
+        raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
+        value = str(raw or "").strip().casefold().replace("-", "_")
+        if value in {"ready", "approved", "approve", "ok"}:
+            return "ready"
+        if value in {"not_ready", "needs_refinement", "refine", "changes_requested"}:
+            return "needs_refinement" if value != "not_ready" else "not_ready"
+        return "missing"
+
+    def _issue_ready_launch_is_auto(self) -> bool:
+        return str(self.config.issue_ready_launch).strip().casefold().replace("-", "_") == ISSUE_READY_LAUNCH_AUTO
 
     def _handle_issue_refinement_request(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         repo = self.storage.get_repo(event.repo_full_name)
@@ -471,6 +478,41 @@ class DaniService:
             actor_type=event.actor_type,
         )
         return self._queue_issue_readiness_review(repo, synthetic)
+
+    def _handle_issue_readiness_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
+        readiness = self._readiness_from_signature(signature)
+        if readiness != "ready":
+            return {"status": "updated", "stage": ISSUE_READINESS_REVIEW_STAGE, "readiness": readiness}
+        if not self._issue_ready_launch_is_auto():
+            return {"status": "updated", "stage": ISSUE_READINESS_REVIEW_STAGE, "readiness": readiness}
+        repo = self.storage.get_repo(event.repo_full_name)
+        if repo is None:
+            return {"status": "ignored", "reason": "missing_repo"}
+        issue_number = int(signature.get("issue") or event.number)
+        if self.storage.is_terminal_issue(repo.full_name, issue_number):
+            return {"status": "ignored", "reason": "issue_terminal"}
+        if self._has_existing_implementation_job(repo.full_name, issue_number):
+            return {"status": "ignored", "reason": "duplicate_implementation"}
+        synthetic = NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name=event.repo_full_name,
+            action=event.action,
+            number=issue_number,
+            actor_login=event.actor_login,
+            payload=event.payload,
+            body=event.body,
+            title=event.title,
+            delivery_id=event.delivery_id,
+            issue_state=event.issue_state,
+            actor_type=event.actor_type,
+        )
+        return self._queue_implementation(
+            repo,
+            synthetic,
+            launch_gate_state="auto_approved",
+            launch_trigger="reviewer_ready_auto",
+            route_reason="issue_readiness_auto_launch",
+        )
 
     def _queue_issue_refinement(self, repo: RepoConfig, event: NormalizedEvent, *, readiness: str) -> dict[str, Any]:
         if self._completed_followup_count(repo.full_name, event.number) >= self.config.max_issue_followups:
@@ -594,6 +636,8 @@ class DaniService:
             return self._handle_issue_refinement_request(event, signature)
         if stage == "issue_followup" and event.kind == "issue_comment":
             return self._handle_planner_refinement_event(event, signature)
+        if stage == ISSUE_READINESS_REVIEW_STAGE and event.kind == "issue_comment":
+            return self._handle_issue_readiness_event(event, signature)
 
 
         if stage == "implementation" and event.kind == "pull_request_comment":
@@ -2666,7 +2710,15 @@ class DaniService:
                 self.storage.mark_terminal_issue(repo.full_name, issue_number)
         return {"status": "marked_terminal", "pr_number": event.number, "merged": merged}
 
-    def _queue_implementation(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
+    def _queue_implementation(
+        self,
+        repo: RepoConfig,
+        event: NormalizedEvent,
+        *,
+        launch_gate_state: str = "approved",
+        launch_trigger: str = "manual_approve",
+        route_reason: str | None = None,
+    ) -> dict[str, Any]:
         line_id = f"issue-{event.number}"
         metadata = {
             "title": event.title or "",
@@ -2674,7 +2726,8 @@ class DaniService:
             "line_id": line_id,
             "issue_id": str(event.number),
             "issue_readiness_state": "ready",
-            "launch_gate_state": "approved",
+            "launch_gate_state": launch_gate_state,
+            "launch_trigger": launch_trigger,
         }
         metadata = self._planned_work_line_metadata(
             repo,
@@ -2683,12 +2736,15 @@ class DaniService:
             pr_number=None,
             metadata=metadata,
         )
+        route_kwargs = self._route_kwargs(event, is_approve_comment=True)
+        if route_reason is not None:
+            route_kwargs["route_reason"] = route_reason
         job = self._enqueue_job(
             repo,
             stage="implementation",
             issue_number=event.number,
             metadata=metadata,
-            **self._route_kwargs(event, is_approve_comment=True),
+            **route_kwargs,
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 

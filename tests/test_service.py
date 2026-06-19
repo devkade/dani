@@ -286,6 +286,71 @@ def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Pa
     assert jobs[-1].metadata["readiness"] == "needs_refinement"
     assert omx_runner.resumes[-1]["job"].stage == "issue_followup"
 
+def test_reviewer_ready_signature_waits_for_manual_approve_by_default(tmp_path: Path) -> None:
+    service, _, omx_runner = make_service(tmp_path)
+    signature = build_signature(stage="issue_readiness_review", job="reviewer-job", issue=45, readiness="ready")
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=45,
+            actor_login="reviewer",
+            payload={"issue": {"body": "context"}},
+            body=signature,
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result == {"status": "updated", "stage": "issue_readiness_review", "readiness": "ready"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=45) == []
+    assert omx_runner.launches == []
+
+
+def test_reviewer_ready_signature_auto_launches_worker_when_configured(tmp_path: Path) -> None:
+    config = DaniConfig(
+        data_dir=tmp_path / ".dani",
+        webhook_secret=TEST_SECRET,
+        issue_ready_launch="auto",
+    )
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeOmxRunner(github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        work_line_manager=FakeWorkLineManager(),
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+    signature = build_signature(stage="issue_readiness_review", job="reviewer-job", issue=46, readiness="ready")
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=46,
+            actor_login="reviewer",
+            payload={"issue": {"body": "context"}},
+            body=signature,
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["stage"] == "implementation"
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=46)[0]
+    assert job.role == "worker"
+    assert job.metadata["route_reason"] == "issue_readiness_auto_launch"
+    assert job.metadata["launch_gate_state"] == "auto_approved"
+    assert job.metadata["launch_trigger"] == "reviewer_ready_auto"
+    assert omx_runner.launches[-1]["job"].stage == "implementation"
+
 
 def test_check_status_queues_reviewer_check_review(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
