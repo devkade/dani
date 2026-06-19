@@ -113,6 +113,14 @@ def test_parse_role_bindings_accepts_global_gjc_runtime() -> None:
 
 
 
+def test_parse_role_bindings_accepts_global_hermes_runtime() -> None:
+    bindings = parse_role_bindings({}, agent_runtime="hermes")
+
+    assert bindings[ROLE_WORKER].runtime == "hermes"
+    assert bindings[ROLE_REVIEWER].runtime == "hermes"
+    assert bindings[ROLE_PLANNER].runtime == "hermes"
+
+
 def test_parse_role_bindings_overrides_single_role_policy() -> None:
     bindings = parse_role_bindings(
         {
@@ -145,6 +153,21 @@ def test_parse_role_bindings_accepts_gjc_role_override() -> None:
     assert bindings[ROLE_WORKER].runtime == "omx"
     assert bindings[ROLE_PLANNER].runtime == "gjc"
     assert bindings[ROLE_PLANNER].display_name == "GJC Planner"
+
+
+def test_parse_role_bindings_accepts_hermes_profile_only_for_hermes_runtime() -> None:
+    bindings = parse_role_bindings(
+        {
+            "reviewer": {"runtime": "hermes", "profile": "reviewer-profile"},
+            "planner": {"runtime": "gjc", "profile": "ignored-profile"},
+        },
+        agent_runtime="omx",
+    )
+
+    assert bindings[ROLE_REVIEWER].runtime == "hermes"
+    assert bindings[ROLE_REVIEWER].profile == "reviewer-profile"
+    assert bindings[ROLE_PLANNER].runtime == "gjc"
+    assert bindings[ROLE_PLANNER].profile is None
 
 
 

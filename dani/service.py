@@ -1162,6 +1162,7 @@ class DaniService:
         runtime = self._runtime_for_comment_recovery_resume(job, preferred_runtime=preferred_runtime)
         prompt = self._build_prompt(repo, job, runtime=runtime)
         runner = self._runner_for_runtime(runtime)
+        self._apply_runtime_launch_metadata(job, runtime)
         resume_session_id = self._recovery_resume_session_id(job, runtime=runtime)
         if resume_session_id:
             try:
@@ -1206,6 +1207,7 @@ class DaniService:
             preferred_runtime=preferred_runtime,
             effective_runtime=runtime,
             fallback_reason=None,
+            hermes_profile=self._hermes_profile_for(job, runtime),
         )
         self.storage.create_session(session)
         self.storage.update_job(
@@ -1282,6 +1284,7 @@ class DaniService:
             bridge_prompt=(bridge_context.prompt_block if bridge_context else ""),
         )
         runner = self._runner_for_runtime(runtime)
+        hermes_profile = self._apply_runtime_launch_metadata(job, runtime)
         repo_path = self._runtime_repo_path(repo, job)
         if resume_session is not None and self._resume_runtime_for_session(resume_session) == runtime:
             session = runner.resume(repo_path, job, prompt, self._session_id_for_resume(job, resume_session))
@@ -1294,6 +1297,7 @@ class DaniService:
             effective_runtime=runtime,
             fallback_reason=fallback_reason,
             bridge_context=bridge_context,
+            hermes_profile=hermes_profile,
         )
         self.storage.create_session(session)
         agent_run_ids = self._agent_run_ids_with(job, session.id)
@@ -1351,11 +1355,13 @@ class DaniService:
         effective_runtime: str,
         fallback_reason: str | None,
         bridge_context: BridgeContext | None = None,
+        hermes_profile: str | None = None,
     ) -> None:
         session.preferred_runtime = preferred_runtime
         session.effective_runtime = effective_runtime
         session.native_session_runtime = effective_runtime
         session.fallback_reason = fallback_reason
+        session.hermes_profile = hermes_profile
         if bridge_context is not None:
             session.bridge_source_runtime = bridge_context.source_runtime
             session.bridge_source_session_id = bridge_context.source_session_id
@@ -1376,22 +1382,48 @@ class DaniService:
         job.metadata["native_session_runtime"] = effective_runtime
         if fallback_reason:
             job.metadata["fallback_reason"] = fallback_reason
-        if bridge_context is not None:
-            if bridge_context.source_runtime:
-                job.metadata["bridge_source_runtime"] = bridge_context.source_runtime
-            if bridge_context.source_session_id:
-                job.metadata["bridge_source_session_id"] = bridge_context.source_session_id
-            if bridge_context.note:
-                job.metadata["bridge_note"] = bridge_context.note
-        if usage_limit_error is not None:
-            job.metadata["usage_limit_runtime"] = RUNTIME_OMO
-            job.metadata["usage_limit_kind"] = usage_limit_error.limit_type
-            if usage_limit_error.reset_hint:
-                job.metadata["usage_limit_reset_hint"] = usage_limit_error.reset_hint
-            if usage_limit_error.suggested_retry_at:
-                job.metadata["usage_limit_until"] = usage_limit_error.suggested_retry_at
+        self._update_job_bridge_metadata(job, bridge_context)
+        self._update_job_usage_limit_metadata(job, usage_limit_error)
         if session.omx_session_id:
             job.metadata["omx_session_id"] = session.omx_session_id
+        if session.hermes_profile:
+            job.metadata["hermes_profile"] = session.hermes_profile
+
+    def _update_job_bridge_metadata(self, job: JobRecord, bridge_context: BridgeContext | None) -> None:
+        if bridge_context is None:
+            return
+        if bridge_context.source_runtime:
+            job.metadata["bridge_source_runtime"] = bridge_context.source_runtime
+        if bridge_context.source_session_id:
+            job.metadata["bridge_source_session_id"] = bridge_context.source_session_id
+        if bridge_context.note:
+            job.metadata["bridge_note"] = bridge_context.note
+
+    def _update_job_usage_limit_metadata(
+        self, job: JobRecord, usage_limit_error: ClaudeUsageLimitError | None
+    ) -> None:
+        if usage_limit_error is None:
+            return
+        job.metadata["usage_limit_runtime"] = RUNTIME_OMO
+        job.metadata["usage_limit_kind"] = usage_limit_error.limit_type
+        if usage_limit_error.reset_hint:
+            job.metadata["usage_limit_reset_hint"] = usage_limit_error.reset_hint
+        if usage_limit_error.suggested_retry_at:
+            job.metadata["usage_limit_until"] = usage_limit_error.suggested_retry_at
+
+    def _apply_runtime_launch_metadata(self, job: JobRecord, runtime: str) -> str | None:
+        profile = self._hermes_profile_for(job, runtime)
+        if profile:
+            job.metadata["hermes_profile"] = profile
+        else:
+            job.metadata.pop("hermes_profile", None)
+        return profile
+
+    def _hermes_profile_for(self, job: JobRecord, runtime: str) -> str | None:
+        if normalize_runtime(runtime) != "hermes":
+            return None
+        role = job.role or str(job.metadata.get("role") or default_role_for_stage(job.stage))
+        return self._role_binding(role).profile
 
     def _runner_for_runtime(self, runtime: str) -> AgentRunner:
         normalized = normalize_runtime(runtime)

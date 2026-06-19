@@ -9,7 +9,16 @@ import pytest
 from dani.agent_runner import AgentRunner
 from dani.errors import ClaudeUsageLimitError, RolloutMissingError
 from dani.github import GitHubCLI
-from dani.models import RUNTIME_GJC, RUNTIME_OMO, RUNTIME_OMX, DaniConfig, JobRecord, NormalizedEvent, SessionRecord
+from dani.models import (
+    RUNTIME_GJC,
+    RUNTIME_HERMES,
+    RUNTIME_OMO,
+    RUNTIME_OMX,
+    DaniConfig,
+    JobRecord,
+    NormalizedEvent,
+    SessionRecord,
+)
 from dani.omx_runner import OmxRunner
 from dani.prompts import NON_INTERACTIVE_GUARD
 from dani.service import DaniService
@@ -174,6 +183,34 @@ def make_gjc_bound_service(tmp_path: Path) -> tuple[DaniService, FakeGitHubCLI, 
     return service, github, gjc_runner
 
 
+def make_hermes_reviewer_service(
+    tmp_path: Path,
+) -> tuple[DaniService, FakeGitHubCLI, FakeRuntimeRunner, FakeRuntimeRunner]:
+    config = DaniConfig(
+        data_dir=tmp_path / ".dani",
+        webhook_secret=TEST_SECRET,
+        agent_runtime=RUNTIME_OMX,
+        role_bindings={
+            "reviewer": {"runtime": RUNTIME_HERMES, "profile": "reviewer-profile"},
+        },
+    )
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    omx_runner = FakeRuntimeRunner(github, runtime_name=RUNTIME_OMX)
+    hermes_runner = FakeRuntimeRunner(github, runtime_name=RUNTIME_HERMES)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, omx_runner),
+        dev_syncer=FakeGitDevSyncer(),
+        runtime_runners={RUNTIME_HERMES: cast(AgentRunner, hermes_runner)},
+        work_line_manager=FakeWorkLineManager(),
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+    return service, github, hermes_runner, omx_runner
+
+
 
 def make_pr_event(
     *,
@@ -300,6 +337,96 @@ def test_role_bound_gjc_runtime_dispatches_and_persists_metadata(tmp_path: Path)
     assert session.effective_runtime == RUNTIME_GJC
     assert session.native_session_runtime == RUNTIME_GJC
     assert session.omx_session_id == f"gjc-{job.id}"
+
+
+def test_hermes_reviewer_binding_uses_profile_and_keeps_worker_default(tmp_path: Path) -> None:
+    service, github, hermes_runner, omx_runner = make_hermes_reviewer_service(tmp_path)
+
+    readiness = service.handle_event(
+        NormalizedEvent(
+            kind="issue_opened",
+            repo_full_name="acme/demo",
+            action="opened",
+            number=74,
+            actor_login="human",
+            payload={},
+            body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    reviewer_job = service.storage.get_job(readiness["job_id"])
+    assert reviewer_job is not None
+    assert reviewer_job.role == "reviewer"
+    assert reviewer_job.metadata["preferred_runtime"] == RUNTIME_HERMES
+    assert reviewer_job.metadata["effective_runtime"] == RUNTIME_HERMES
+    assert reviewer_job.metadata["hermes_profile"] == "reviewer-profile"
+    assert len(hermes_runner.launches) == 1
+    assert hermes_runner.launches[0]["job"].metadata["hermes_profile"] == "reviewer-profile"
+    reviewer_session = service.storage.list_sessions()[0]
+    assert reviewer_session.effective_runtime == RUNTIME_HERMES
+    assert reviewer_session.hermes_profile == "reviewer-profile"
+
+    add_ready_issue_signature(github, "acme/demo", 74)
+    implementation = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=74,
+            actor_login="maintainer",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    worker_job = service.storage.get_job(implementation["job_id"])
+    assert worker_job is not None
+    assert worker_job.role == "worker"
+    assert worker_job.metadata["preferred_runtime"] == RUNTIME_OMX
+    assert worker_job.metadata["effective_runtime"] == RUNTIME_OMX
+    assert "hermes_profile" not in worker_job.metadata
+    assert len(omx_runner.launches) == 1
+    assert omx_runner.launches[0]["job"].stage == "implementation"
+
+
+def test_hermes_reviewer_binding_covers_pr_reviewer_stages(tmp_path: Path) -> None:
+    service, _, hermes_runner, omx_runner = make_hermes_reviewer_service(tmp_path)
+
+    service.handle_event(make_pr_event(pr_number=75, action="opened", body="Implements #75"))
+    service.wait_for_idle()
+    service.handle_event(
+        NormalizedEvent(
+            kind="check_status",
+            repo_full_name="acme/demo",
+            action="completed",
+            number=75,
+            actor_login="github-actions",
+            payload={},
+            commit_sha="abc123",
+            is_pull_request=True,
+        )
+    )
+    service.wait_for_idle()
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+    final_verdict = service.storage.create_job(
+        JobRecord(repo_full_name="acme/demo", stage="final_verdict", role="reviewer", pr_number=75)
+    )
+    service._run_job_attempt(repo, final_verdict)
+
+    jobs = service.storage.list_jobs()
+    reviewer_stages = {job.stage for job in jobs if job.role == "reviewer"}
+    assert {"review_round", "check_review"}.issubset(reviewer_stages)
+    assert "final_verdict" in reviewer_stages
+    assert all(job.metadata["hermes_profile"] == "reviewer-profile" for job in jobs if job.role == "reviewer")
+    assert len(hermes_runner.launches) == 3
+    assert omx_runner.launches == []
+
+
 def test_gjc_runtime_failure_does_not_fallback_to_omx(tmp_path: Path) -> None:
     service, _, gjc_runner = make_gjc_bound_service(tmp_path)
     gjc_runner.queue_wait_error(RuntimeError("gjc boom"))

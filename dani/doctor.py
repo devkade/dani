@@ -830,10 +830,12 @@ VALID_AGENT_RUNTIMES = frozenset({
     "opencode",
     "gjc",
     "gajae-code",
+    "hermes",
 })
 OMX_FAMILY = frozenset({"omx", "oh-my-codex", "codex"})
 OMO_FAMILY = frozenset({"omo", "oh-my-openagents", "oh-my-openagent", "opencode"})
 GJC_FAMILY = frozenset({"gjc", "gajae-code"})
+HERMES_FAMILY = frozenset({"hermes"})
 
 
 def _resolved_agent_runtime(ctx: CheckContext) -> str:
@@ -1041,6 +1043,23 @@ def _check_binaries(ctx: CheckContext) -> CheckResult:
     else:
         records.append({
             "name": "gjc",
+            "found": None,
+            "required": False,
+            "severity": CheckStatus.SKIP.value,
+            "skip_reason": f"agent_runtime={runtime}",
+        })
+    if runtime in HERMES_FAMILY:
+        records.append(
+            _binary_record(
+                "hermes",
+                required=True,
+                timeout_seconds=ctx.timeout_seconds,
+                severity_when_missing=CheckStatus.FAIL,
+            )
+        )
+    else:
+        records.append({
+            "name": "hermes",
             "found": None,
             "required": False,
             "severity": CheckStatus.SKIP.value,
@@ -1796,6 +1815,8 @@ def _classify_ps_command(command: str) -> str | None:
         return "opencode_run"
     if "gjc -p" in command or "gjc --resume" in command:
         return "gjc_print"
+    if "hermes " in command and " chat " in command:
+        return "hermes_chat"
     return None
 
 

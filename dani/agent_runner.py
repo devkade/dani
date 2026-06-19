@@ -15,6 +15,7 @@ RUNTIME_ALIASES: dict[str, str] = {
     "opencode": "omo",
     "gjc": "gjc",
     "gajae-code": "gjc",
+    "hermes": "hermes",
 }
 
 
@@ -69,13 +70,14 @@ def normalize_runtime(runtime: str | None) -> str:
     normalized = (runtime or "omx").strip().lower()
     if normalized in RUNTIME_ALIASES:
         return RUNTIME_ALIASES[normalized]
-    msg = f"unknown agent runtime: {runtime!r} (expected 'omx', 'omo', or 'gjc')"
+    msg = f"unknown agent runtime: {runtime!r} (expected 'omx', 'omo', 'gjc', or 'hermes')"
     raise ValueError(msg)
 
 
 def build_agent_runner(runtime: str, run_dir: Path) -> AgentRunner:
-    """Factory returning the AgentRunner matching *runtime* (``omx``, ``omo``, or ``gjc``)."""
+    """Factory returning the AgentRunner matching *runtime* (``omx``, ``omo``, ``gjc``, or ``hermes``)."""
     from dani.gjc_runner import GjcRunner
+    from dani.hermes_runner import HermesRunner
     from dani.omo_http_runner import OmoHttpRunner
     from dani.omx_runner import OmxRunner
 
@@ -86,5 +88,7 @@ def build_agent_runner(runtime: str, run_dir: Path) -> AgentRunner:
         return cast(AgentRunner, OmoHttpRunner(run_dir))
     if normalized == "gjc":
         return cast(AgentRunner, GjcRunner(run_dir))
-    msg = f"unknown agent runtime: {runtime!r} (expected 'omx', 'omo', or 'gjc')"
+    if normalized == "hermes":
+        return cast(AgentRunner, HermesRunner(run_dir))
+    msg = f"unknown agent runtime: {runtime!r} (expected 'omx', 'omo', 'gjc', or 'hermes')"
     raise ValueError(msg)

@@ -66,11 +66,13 @@ class AgentRoleBinding:
         forbidden = payload.get("forbidden_actions")
         allowed = payload.get("allowed_actions")
         skills = payload.get("skills")
+        normalized_runtime = normalize_runtime(runtime)
+        profile = _optional_str(payload.get("profile")) if normalized_runtime == "hermes" else None
         return cls(
             role=role,
-            runtime=normalize_runtime(runtime),
+            runtime=normalized_runtime,
             display_name=_optional_str(payload.get("display_name") or payload.get("agent")),
-            profile=_optional_str(payload.get("profile")),
+            profile=profile,
             command=_optional_str(payload.get("command")),
             skills=[str(item) for item in skills] if isinstance(skills, list) else [],
             allowed_actions=[str(item) for item in allowed] if isinstance(allowed, list) else [],
