@@ -250,6 +250,13 @@ class FakeOmxRunner:
                 issue_number,
                 build_signature(stage="issue_request", job=job.id, issue=issue_number),
             )
+        elif job.stage == "issue_followup":
+            issue_number = int((signature or {}).get("issue", job.issue_number or 0))
+            self.github.add_issue_signature(
+                repo_full_name,
+                issue_number,
+                build_signature(stage="issue_followup", job=job.id, issue=issue_number),
+            )
         elif job.stage == "issue_readiness_review":
             issue_number = int((signature or {}).get("issue", job.issue_number or 0))
             self.github.add_issue_signature(
@@ -257,7 +264,7 @@ class FakeOmxRunner:
                 issue_number,
                 build_signature(stage="issue_readiness_review", job=job.id, issue=issue_number, readiness="ready"),
             )
-        elif job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
+        elif job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
             self._post_recovery_side_effect(repo_full_name, job)
         elif job.stage == "implementation":
             issue_number = int((signature or {}).get("issue", job.issue_number or 0))

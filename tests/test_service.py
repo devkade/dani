@@ -189,7 +189,7 @@ def make_pr_comment_event(*, pr_number: int, body: str, actor_login: str = "agen
     )
 
 
-def test_issue_request_persists_omx_session_id(tmp_path: Path) -> None:
+def test_issue_readiness_review_persists_omx_session_id(tmp_path: Path) -> None:
     service, _, _ = make_service(tmp_path)
 
     service.handle_event(
@@ -209,7 +209,7 @@ def test_issue_request_persists_omx_session_id(tmp_path: Path) -> None:
     session = service.storage.list_sessions()[0]
     assert session.omx_session_id == "omx-" + session.job_id
 
-def test_issue_opened_carries_planner_role_policy(tmp_path: Path) -> None:
+def test_issue_opened_carries_reviewer_role_policy(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
 
     result = service.handle_event(
@@ -228,23 +228,23 @@ def test_issue_opened_carries_planner_role_policy(tmp_path: Path) -> None:
 
     job = service.storage.get_job(result["job_id"])
     assert job is not None
-    assert job.role == "planner"
-    assert job.stage == "issue_request"
-    assert job.metadata["role"] == "planner"
+    assert job.role == "reviewer"
+    assert job.stage == "issue_readiness_review"
+    assert job.metadata["role"] == "reviewer"
     assert job.metadata["route_reason"] == "issue_opened"
     assert job.metadata["target"]["issue_number"] == 22
     assert "push_commits" in job.metadata["forbidden_actions"]
     session = service.storage.list_sessions()[0]
-    assert session.role == "planner"
+    assert session.role == "reviewer"
     prompt = omx_runner.launches[-1]["prompt"]
     assert "Dani role policy:" in prompt
-    assert "- Role: planner" in prompt
+    assert "- Role: reviewer" in prompt
     assert "Forbidden actions: push_commits" in prompt
 
 
 def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
-    # Seed the planner lineage so refinement can resume the existing issue discussion.
+    # Seed reviewer-first issue intake so refinement can launch an isolated planner session.
     service.handle_event(
         NormalizedEvent(
             kind="issue_opened",
@@ -282,7 +282,7 @@ def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Pa
     jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=44)
     assert jobs[-1].role == "planner"
     assert jobs[-1].metadata["readiness"] == "needs_refinement"
-    assert omx_runner.resumes[-1]["job"].stage == "issue_followup"
+    assert omx_runner.launches[-1]["job"].stage == "issue_followup"
 
 def test_reviewer_ready_signature_waits_for_manual_approve_by_default(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
@@ -401,7 +401,7 @@ def test_issue_request_verification_rejects_stale_signature(tmp_path: Path) -> N
         service._verify_side_effect(repo, job)
 
 
-def test_issue_opened_queues_issue_request(tmp_path: Path) -> None:
+def test_issue_opened_queues_reviewer_readiness_review(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
     event = NormalizedEvent(
         kind="issue_opened",
@@ -418,7 +418,7 @@ def test_issue_opened_queues_issue_request(tmp_path: Path) -> None:
     service.wait_for_idle()
 
     assert result["status"] == "queued"
-    assert omx_runner.launches[0]["job"].stage == "issue_request"
+    assert omx_runner.launches[0]["job"].stage == "issue_readiness_review"
     assert service.storage.list_jobs()[0].status == "completed"
     assert omx_runner.closed_sessions == [f"runtime-{service.storage.list_jobs()[0].id}"]
     session = service.storage.list_sessions()[0]
@@ -427,7 +427,7 @@ def test_issue_opened_queues_issue_request(tmp_path: Path) -> None:
     assert session.termination_reason == "completed"
 
 
-def test_general_issue_comment_resumes_planner_issue_session(tmp_path: Path) -> None:
+def test_general_issue_comment_launches_or_resumes_planner_issue_session(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
     service.handle_event(
         NormalizedEvent(
@@ -458,8 +458,7 @@ def test_general_issue_comment_resumes_planner_issue_session(tmp_path: Path) -> 
     service.wait_for_idle()
 
     assert result["stage"] == "issue_followup"
-    assert omx_runner.resumes[-1]["omx_session_id"].startswith("omx-")
-    assert omx_runner.resumes[-1]["job"].stage == "issue_followup"
+    assert omx_runner.launches[-1]["job"].stage == "issue_followup"
     followup_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=31)
     assert len(followup_jobs) == 1
 
@@ -514,7 +513,7 @@ def test_issue_request_falls_back_from_omo_to_omx_on_claude_session_limit(tmp_pa
     )
     service.wait_for_idle()
 
-    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_request", issue_number=51)[0]
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_readiness_review", issue_number=51)[0]
     sessions = service.storage.list_sessions()
     assert job.status == "completed"
     assert job.metadata["preferred_runtime"] == RUNTIME_OMO
@@ -531,7 +530,7 @@ def test_issue_request_falls_back_from_omo_to_omx_on_claude_session_limit(tmp_pa
     assert sessions[1].status == "completed"
 
 
-def test_issue_request_uses_cached_claude_weekly_limit_to_start_directly_on_omx(tmp_path: Path) -> None:
+def test_issue_readiness_uses_cached_claude_weekly_limit_to_start_directly_on_omx(tmp_path: Path) -> None:
     service, _, omo_runner, omx_runner = make_omo_preferred_service(tmp_path)
     service.storage.create_job(
         JobRecord(
@@ -561,7 +560,7 @@ def test_issue_request_uses_cached_claude_weekly_limit_to_start_directly_on_omx(
     )
     service.wait_for_idle()
 
-    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_request", issue_number=52)[0]
+    job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_readiness_review", issue_number=52)[0]
     assert job.status == "completed"
     assert job.metadata["effective_runtime"] == RUNTIME_OMX
     assert job.metadata["fallback_reason"] == "cached_claude_usage_limit"
@@ -577,7 +576,7 @@ def test_issue_followup_after_omo_fallback_continues_on_omx_session(tmp_path: Pa
             "weekly limit reached",
             "weekly",
             reset_hint="next week",
-            suggested_retry_at="2026-04-29T00:00:00+00:00",
+            suggested_retry_at="2099-04-29T00:00:00+00:00",
         )
     )
 
@@ -616,8 +615,9 @@ def test_issue_followup_after_omo_fallback_continues_on_omx_session(tmp_path: Pa
     assert review_job.status == "completed"
     assert review_job.metadata["effective_runtime"] == RUNTIME_OMX
     assert len(omo_runner.resumes) == 0
-    assert len(omx_runner.resumes) == 1
-    assert omx_runner.resumes[0]["job"].stage == "issue_followup"
+    assert len(omx_runner.resumes) == 0
+    assert len(omx_runner.launches) == 2
+    assert omx_runner.launches[-1]["job"].stage == "issue_followup"
 
 
 def test_service_build_prompt_uses_effective_runtime_not_configured_runtime(tmp_path: Path) -> None:
@@ -726,16 +726,12 @@ def test_issue_comment_with_unresumable_prior_session_falls_back_to_fresh_issue_
     )
     service.wait_for_idle()
 
-    request_jobs = [
-        job for job in service.storage.list_jobs() if job.stage == "issue_request" and job.issue_number == 731
-    ]
     followup_jobs = [
         job for job in service.storage.list_jobs() if job.stage == "issue_followup" and job.issue_number == 731
     ]
-    assert request_jobs, "expected a fresh issue_request to be enqueued when prior session id is non-resumable"
-    assert not followup_jobs, "must NOT enqueue an issue_followup against an un-resumable session id"
+    assert followup_jobs, "expected a fresh issue_followup to be enqueued when prior planner session id is non-resumable"
     assert not omx_runner.resumes, "runner.resume must not be invoked when can_resume returned False"
-    new_job = next(job for job in request_jobs if job.id != legacy_session.job_id)
+    new_job = followup_jobs[-1]
     assert new_job.metadata["rerouted_from"] == "issue_followup"
     assert new_job.metadata["prior_session_id"] == legacy_session_id
     assert new_job.metadata["comment_body"] == "this is a fresh comment on a legacy issue"
@@ -903,6 +899,19 @@ def test_issue_followup_rollout_missing_marks_job_failed_and_posts_restart_warni
         )
     )
     service.wait_for_idle()
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=33,
+            actor_login="human",
+            payload={"issue": {"body": "Need automation"}},
+            body="Initial planner refinement.",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
 
     omx_runner.set_resume_failure(
         RolloutMissingError(
@@ -952,6 +961,19 @@ def test_issue_followup_rollout_missing_warning_comment_is_posted_only_once(tmp_
         )
     )
     service.wait_for_idle()
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=34,
+            actor_login="human",
+            payload={"issue": {"body": "Need automation"}},
+            body="Initial planner refinement.",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
     omx_runner.set_resume_failure(
         RolloutMissingError(
             "thread/resume failed: no rollout found for thread id 019d6829",
@@ -983,8 +1005,9 @@ def test_issue_followup_rollout_missing_warning_comment_is_posted_only_once(tmp_
     )
     assert len(warning_comments) == 1
     review_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=34)
-    assert len(review_jobs) == 2
-    assert all(job.status == "failed" for job in review_jobs)
+    assert len(review_jobs) == 3
+    assert review_jobs[0].status == "completed"
+    assert all(job.status == "failed" for job in review_jobs[1:])
 
 
 def test_issue_followup_rollout_missing_retries_warning_after_comment_post_failure(tmp_path: Path) -> None:
@@ -998,6 +1021,19 @@ def test_issue_followup_rollout_missing_retries_warning_after_comment_post_failu
             actor_login="human",
             payload={},
             body="Need automation",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=35,
+            actor_login="human",
+            payload={"issue": {"body": "Need automation"}},
+            body="Initial planner refinement.",
             title="Need automation",
         )
     )
@@ -1054,7 +1090,7 @@ def test_issue_followup_rollout_missing_retries_warning_after_comment_post_failu
     assert len(matching_keys) == 1
 
 
-def test_restart_issue_supersedes_existing_jobs_and_enqueues_new_issue_request(tmp_path: Path) -> None:
+def test_restart_issue_supersedes_existing_jobs_and_enqueues_new_readiness_review(tmp_path: Path) -> None:
     service, github, _ = make_service(tmp_path)
     service.queue_manager.submit = lambda job: None  # type: ignore[assignment]
     stale_request = JobRecord(
@@ -1088,7 +1124,7 @@ def test_restart_issue_supersedes_existing_jobs_and_enqueues_new_issue_request(t
     assert refreshed_request is not None and refreshed_request.status == "superseded"
     assert refreshed_followup is not None and refreshed_followup.status == "superseded"
     assert untouched_job is not None and untouched_job.status == "completed"
-    assert new_job.stage == "issue_request"
+    assert new_job.stage == "issue_readiness_review"
     assert new_job.status == "queued"
     assert new_job.issue_number == 41
     repo = service.storage.get_repo("acme/demo")
@@ -3829,7 +3865,7 @@ def test_bootstrap_repo_queues_existing_open_issues(tmp_path: Path) -> None:
     first_job = omx_runner.launches[0]["job"]
     assert isinstance(first_job, JobRecord)
     assert first_job.issue_number == 5
-    assert first_job.stage == "issue_request"
+    assert first_job.stage == "issue_readiness_review"
 
 
 def test_bootstrap_repo_skips_issues_with_existing_issue_request_signature(tmp_path: Path) -> None:
@@ -3852,7 +3888,7 @@ def test_bootstrap_repo_skips_issues_with_existing_issue_request_signature(tmp_p
     only_job = omx_runner.launches[0]["job"]
     assert isinstance(only_job, JobRecord)
     assert only_job.issue_number == 6
-    assert only_job.stage == "issue_request"
+    assert only_job.stage == "issue_readiness_review"
 
 
 def test_external_pr_to_main_posts_retarget_comment_and_is_ignored(tmp_path: Path) -> None:
@@ -4152,7 +4188,7 @@ def test_dev_sync_conflict_falls_back_from_omo_to_omx_on_weekly_limit(tmp_path: 
             "weekly limit reached",
             "weekly",
             reset_hint="next week",
-            suggested_retry_at="2026-04-29T00:00:00+00:00",
+            suggested_retry_at="2099-04-29T00:00:00+00:00",
         )
     )
 
@@ -4445,12 +4481,12 @@ class MissingIssueCommentRunner(FakeOmxRunner):
                 review_round=job.review_round,
                 omx_session_id=f"omx-{job.id}" if self.resumable else None,
             )
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"} and self.recover:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"} and self.recover:
             self._post_recovery_signature(job)
         return super().launch(repo_path, job, prompt)
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str):
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"} and self.recover:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"} and self.recover:
             self._post_recovery_signature(job)
         self.resumes.append({
             "repo_path": str(repo_path),
@@ -4502,7 +4538,7 @@ def make_missing_comment_service(
     return service, github, omx_runner
 
 
-def test_issue_request_missing_signature_recovers_with_original_signature(tmp_path: Path) -> None:
+def test_issue_readiness_missing_signature_recovers_with_original_signature(tmp_path: Path) -> None:
     service, github, omx_runner = make_missing_comment_service(tmp_path)
 
     service.handle_event(
@@ -4523,13 +4559,13 @@ def test_issue_request_missing_signature_recovers_with_original_signature(tmp_pa
     source_job = jobs[0]
     recovery_job = jobs[1]
     expected_signature = build_signature(
-        stage="issue_request", job=source_job.id, issue=40
+        stage="issue_readiness_review", job=source_job.id, issue=40, readiness="ready"
     )
-    assert source_job.stage == "issue_request"
+    assert source_job.stage == "issue_readiness_review"
     assert source_job.status == "completed"
     assert source_job.metadata["comment_recovery_attempts"] == 1
     assert source_job.metadata["comment_recovery_job_id"] == recovery_job.id
-    assert recovery_job.stage == "issue_request_recovery"
+    assert recovery_job.stage == "issue_readiness_review_recovery"
     assert recovery_job.status == "completed"
     assert recovery_job.metadata["source_job_id"] == source_job.id
     assert recovery_job.metadata["expected_signature"] == expected_signature
@@ -4540,7 +4576,7 @@ def test_issue_request_missing_signature_recovers_with_original_signature(tmp_pa
     assert "GitHub issue comment exactly once" in recovery_prompt
 
 
-def test_issue_request_recovery_failure_is_bounded_and_records_details(tmp_path: Path) -> None:
+def test_issue_readiness_recovery_failure_is_bounded_and_records_details(tmp_path: Path) -> None:
     service, _, _ = make_missing_comment_service(tmp_path, recover=False)
 
     service.handle_event(
@@ -4559,16 +4595,16 @@ def test_issue_request_recovery_failure_is_bounded_and_records_details(tmp_path:
 
     source_job, recovery_job = service.storage.list_jobs()
     assert source_job.status == "failed"
-    assert source_job.metadata["error"] == "issue-request-comment-missing"
-    assert source_job.metadata["original_error"] == "issue-request-comment-missing"
+    assert source_job.metadata["error"] == "issue-readiness-review-comment-missing"
+    assert source_job.metadata["original_error"] == "issue-readiness-review-comment-missing"
     assert source_job.metadata["comment_recovery_attempts"] == 1
     assert source_job.metadata["comment_recovery_job_id"] == recovery_job.id
     assert source_job.metadata["comment_recovery_session_id"] == recovery_job.session_id
-    assert source_job.metadata["comment_recovery_last_error"] == "issue-request-comment-missing"
+    assert source_job.metadata["comment_recovery_last_error"] == "issue-readiness-review-comment-missing"
     assert recovery_job.status == "failed"
 
 
-def test_issue_request_recovery_uses_fresh_launch_when_original_session_cannot_resume(tmp_path: Path) -> None:
+def test_issue_readiness_recovery_uses_fresh_launch_when_original_session_cannot_resume(tmp_path: Path) -> None:
     service, _, omx_runner = make_missing_comment_service(tmp_path, resumable=False)
 
     service.handle_event(
@@ -4587,8 +4623,8 @@ def test_issue_request_recovery_uses_fresh_launch_when_original_session_cannot_r
 
     assert not omx_runner.resumes
     assert [record["job"].stage for record in omx_runner.launches] == [
-        "issue_request",
-        "issue_request_recovery",
+        "issue_readiness_review",
+        "issue_readiness_review_recovery",
     ]
     source_job, recovery_job = service.storage.list_jobs()
     assert source_job.status == "completed"
@@ -4636,6 +4672,19 @@ def test_issue_followup_missing_signature_recovers_with_original_signature(tmp_p
         )
     )
     service.wait_for_idle()
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=43,
+            actor_login="human",
+            payload={"issue": {"body": "Need planning"}},
+            body="Initial planner refinement.",
+            title="Need planning",
+        )
+    )
+    service.wait_for_idle()
     omx_runner.resume_error = RuntimeError("issue-followup-comment-missing")
 
     service.handle_event(
@@ -4653,7 +4702,8 @@ def test_issue_followup_missing_signature_recovers_with_original_signature(tmp_p
     service.wait_for_idle()
 
     jobs = service.storage.list_jobs()
-    followup_job = next(job for job in jobs if job.stage == "issue_followup")
+    followup_jobs = [job for job in jobs if job.stage == "issue_followup"]
+    followup_job = followup_jobs[-1]
     recovery_job = next(job for job in jobs if job.stage == "issue_followup_recovery")
     expected_signature = build_signature(stage="issue_followup", job=followup_job.id, issue=43)
     assert followup_job.status == "completed"
@@ -4665,7 +4715,7 @@ def test_issue_followup_missing_signature_recovers_with_original_signature(tmp_p
 
 class ResumeExceptionAfterPostingRecoveryRunner(MissingIssueCommentRunner):
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str):
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
             self._post_recovery_signature(job)
             self.resumes.append({
                 "repo_path": str(repo_path),
@@ -4684,10 +4734,10 @@ class ResumeWaitFailureRecoveryRunner(MissingIssueCommentRunner):
         self.post_before_failure = post_before_failure
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str):
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"} and self.post_before_failure:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"} and self.post_before_failure:
             self._post_recovery_signature(job)
         session = super().resume(repo_path, job, prompt, omx_session_id)
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
             self._fail_next_resume_wait = True
         return session
 
@@ -4698,7 +4748,7 @@ class ResumeWaitFailureRecoveryRunner(MissingIssueCommentRunner):
         return super().wait(runtime_handle, poll_interval=poll_interval, timeout_seconds=timeout_seconds)
 
     def launch(self, repo_path: Path, job: JobRecord, prompt: str):
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
             self._post_recovery_signature(job)
         return super().launch(repo_path, job, prompt)
 
@@ -4709,20 +4759,20 @@ class RecoveryTransientFailureRunner(MissingIssueCommentRunner):
 
     def launch(self, repo_path: Path, job: JobRecord, prompt: str):
         session = super().launch(repo_path, job, prompt)
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
             self.set_transient_failures(1)
         return session
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str):
         session = super().resume(repo_path, job, prompt, omx_session_id)
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
             self.set_transient_failures(1)
         return session
 
 
 class CommentRecoveryRuntimeRunner(FakeRuntimeRunner):
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str) -> SessionRecord:
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
+        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
             expected_signature = str(job.metadata["expected_signature"])
             self.github.add_issue_signature(job.repo_full_name, int(job.issue_number or 0), expected_signature)
         return super().resume(repo_path, job, prompt, omx_session_id)
@@ -4869,7 +4919,7 @@ def test_issue_request_recovery_prefers_source_job_session_when_newer_same_issue
     assert recovery_job.metadata["source_omx_session_id"] == "omx-source"
 
 
-def test_issue_request_recovery_falls_back_to_fresh_launch_when_resumed_process_fails(tmp_path: Path) -> None:
+def test_issue_readiness_recovery_falls_back_to_fresh_launch_when_resumed_process_fails(tmp_path: Path) -> None:
     config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
     storage = JsonStorage(config)
     github = FakeGitHubCLI()
@@ -4900,15 +4950,15 @@ def test_issue_request_recovery_falls_back_to_fresh_launch_when_resumed_process_
     source_job, recovery_job = service.storage.list_jobs()
     assert source_job.status == "completed"
     assert recovery_job.status == "completed"
-    assert [record["job"].stage for record in omx_runner.resumes] == ["issue_request_recovery"]
+    assert [record["job"].stage for record in omx_runner.resumes] == ["issue_readiness_review_recovery"]
     assert [record["job"].stage for record in omx_runner.launches] == [
-        "issue_request",
-        "issue_request_recovery",
+        "issue_readiness_review",
+        "issue_readiness_review_recovery",
     ]
     assert recovery_job.metadata["comment_recovery_resume_error"] == "resume failed"
 
 
-def test_issue_request_recovery_does_not_fresh_launch_when_resume_exception_posted_signature(tmp_path: Path) -> None:
+def test_issue_readiness_recovery_does_not_fresh_launch_when_resume_exception_posted_signature(tmp_path: Path) -> None:
     config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
     storage = JsonStorage(config)
     github = FakeGitHubCLI()
@@ -4938,21 +4988,21 @@ def test_issue_request_recovery_does_not_fresh_launch_when_resume_exception_post
 
     source_job, recovery_job = service.storage.list_jobs()
     expected_signature = build_signature(
-        stage="issue_request", job=source_job.id, issue=50
+        stage="issue_readiness_review", job=source_job.id, issue=50, readiness="ready"
     )
     matching_comments = github.find_comments_by_signature(
         "acme/demo", 50, kind="issue", signature_fragment=expected_signature
     )
     assert source_job.status == "completed"
     assert recovery_job.status == "completed"
-    assert [record["job"].stage for record in omx_runner.resumes] == ["issue_request_recovery"]
-    assert [record["job"].stage for record in omx_runner.launches] == ["issue_request"]
+    assert [record["job"].stage for record in omx_runner.resumes] == ["issue_readiness_review_recovery"]
+    assert [record["job"].stage for record in omx_runner.launches] == ["issue_readiness_review"]
     assert len(matching_comments) == 1
     assert recovery_job.metadata["comment_recovery_resume_error"] == "resume raised after posting signature"
     assert recovery_job.metadata["note"] == "side_effect_already_posted"
 
 
-def test_issue_request_recovery_does_not_fresh_launch_when_failed_resume_posted_signature(tmp_path: Path) -> None:
+def test_issue_readiness_recovery_does_not_fresh_launch_when_failed_resume_posted_signature(tmp_path: Path) -> None:
     config = DaniConfig(data_dir=tmp_path / ".dani", webhook_secret=TEST_SECRET)
     storage = JsonStorage(config)
     github = FakeGitHubCLI()
@@ -4982,15 +5032,15 @@ def test_issue_request_recovery_does_not_fresh_launch_when_failed_resume_posted_
 
     source_job, recovery_job = service.storage.list_jobs()
     expected_signature = build_signature(
-        stage="issue_request", job=source_job.id, issue=47
+        stage="issue_readiness_review", job=source_job.id, issue=47, readiness="ready"
     )
     matching_comments = github.find_comments_by_signature(
         "acme/demo", 47, kind="issue", signature_fragment=expected_signature
     )
     assert source_job.status == "completed"
     assert recovery_job.status == "completed"
-    assert [record["job"].stage for record in omx_runner.resumes] == ["issue_request_recovery"]
-    assert [record["job"].stage for record in omx_runner.launches] == ["issue_request"]
+    assert [record["job"].stage for record in omx_runner.resumes] == ["issue_readiness_review_recovery"]
+    assert [record["job"].stage for record in omx_runner.launches] == ["issue_readiness_review"]
     assert len(matching_comments) == 1
     assert recovery_job.metadata["comment_recovery_resume_error"] == "resume failed"
     assert recovery_job.metadata["note"] == "side_effect_already_posted"
@@ -5030,7 +5080,7 @@ def test_recovery_transient_exhaustion_fails_source_job_with_recovery_metadata(
     source_job, recovery_job = service.storage.list_jobs()
     assert recovery_job.status == "failed"
     assert source_job.status == "failed"
-    assert source_job.metadata["original_error"] == "issue-request-comment-missing"
+    assert source_job.metadata["original_error"] == "issue-readiness-review-comment-missing"
     assert source_job.metadata["comment_recovery_job_id"] == recovery_job.id
     assert source_job.metadata["comment_recovery_last_error"].startswith("retry_exhausted:")
 

@@ -28,7 +28,7 @@ class FakeRestartService:
 
     def restart_issue(self, repo_full_name: str, issue_number: int) -> JobRecord:
         self.calls.append(("restart_issue", repo_full_name, issue_number))
-        return JobRecord(repo_full_name=repo_full_name, stage="issue_request", issue_number=issue_number, id="job-123")
+        return JobRecord(repo_full_name=repo_full_name, stage="issue_readiness_review", issue_number=issue_number, id="job-123")
 
     def wait_for_idle(self) -> None:
         self.calls.append(("wait_for_idle", None))
@@ -72,7 +72,7 @@ def test_restart_issue_invokes_service_waits_for_idle_and_prints_job(tmp_path: P
     assert fake_service.calls == [("restart_issue", "acme/demo", 41), ("wait_for_idle", None)]
     payload = json.loads(result.stdout)
     assert payload["id"] == "job-123"
-    assert payload["stage"] == "issue_request"
+    assert payload["stage"] == "issue_readiness_review"
     assert payload["issue_number"] == 41
 
 

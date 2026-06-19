@@ -343,7 +343,7 @@ def test_issue_request_prompt_declares_planning_only_role() -> None:
     assert "DO NOT write code" in prompt
     assert "your session ENDS" in prompt
     assert "/approve" in prompt
-    assert "NEW, SEPARATE agent session" in prompt
+    assert "NEW, SEPARATE worker session" in prompt
 
 
 def test_issue_request_prompt_forbids_self_handoff_promises() -> None:
@@ -375,7 +375,7 @@ def test_issue_followup_prompt_mentions_async_decisions_not_open_questions() -> 
     assert 'assumptions / human decisions to resolve asynchronously before "/approve"' in prompt
     assert "remaining open questions" not in prompt
     assert "/approve" in prompt
-    assert "NEW, SEPARATE agent session" in prompt
+    assert "NEW, SEPARATE worker session" in prompt
 
 
 def test_issue_followup_prompt_forbids_self_handoff_promises() -> None:

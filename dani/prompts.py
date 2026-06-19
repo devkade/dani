@@ -82,7 +82,7 @@ Task: review GitHub issue #$issue_number titled "$issue_title".
 ROLE: PLANNING AGENT (read-only analysis, no implementation).
 - You analyze and propose a plan. You DO NOT write code, create branches, or open PRs in this session.
 - After you post the comment, your session ENDS. dani discards your in-memory state.
-- Implementation only starts when a human responds with a comment containing "/approve". At that point dani spawns a NEW, SEPARATE agent session in a fresh process. That agent does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
+- Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
 - Do NOT promise to "create a PR", "open a branch", "write the code", "push commits", or "do the work next". Phrase the plan as "the implementation agent will...".
 - Your comment is the entire handoff. Make it self-contained: anything the implementation agent must know has to be IN the comment text.
 
@@ -141,7 +141,7 @@ Issue title: $issue_title
 ROLE: PLANNING AGENT (read-only analysis, no implementation).
 - You refine the plan based on the new comment. You DO NOT write code, create branches, or open PRs in this session.
 - After you post the comment, your session ENDS. dani discards your in-memory state.
-- Implementation only starts when a human responds with a comment containing "/approve". At that point dani spawns a NEW, SEPARATE agent session in a fresh process. That agent does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
+- Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
 - Do NOT promise to "create a PR", "open a branch", "write the code", "push commits", or "do the work next". Phrase next steps as "the implementation agent will...".
 - Your comment is the entire handoff. Make it self-contained: anything the implementation agent must know has to be IN the comment text or in earlier visible discussion.
 
