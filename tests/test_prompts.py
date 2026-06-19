@@ -610,9 +610,25 @@ def _dev_sync_conflict_context() -> dict[str, object]:
         "commit_message": "Merge main into dev",
     }
 
+def _issue_readiness_review_context() -> dict[str, object]:
+    return {
+        "repo": "acme/demo",
+        "local_path": "workspace/demo",
+        "issue_number": 7,
+        "issue_title": "Need a bot",
+        "issue_body": "Implement it",
+        "comment_body": "Can this proceed?",
+        "discussion": "history",
+        "ready_signature": "<!-- dani:stage=issue_readiness_review;job=abc;issue=7;readiness=ready -->",
+        "not_ready_signature": "<!-- dani:stage=issue_readiness_review;job=abc;issue=7;readiness=not_ready -->",
+        "needs_refinement_signature": "<!-- dani:stage=issue_readiness_review;job=abc;issue=7;readiness=needs_refinement -->",
+    }
+
+
 
 _NON_INTERACTIVE_TEMPLATE_CONTEXTS: dict[str, dict[str, object]] = {
     "issue_request": _issue_request_context(),
+    "issue_readiness_review": _issue_readiness_review_context(),
     "issue_followup": _issue_followup_context(),
     "implementation": _implementation_context(),
     "review_round": _review_round_context(),

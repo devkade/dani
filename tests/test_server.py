@@ -12,6 +12,7 @@ from dani.github import GitHubCLI
 from dani.models import DaniConfig
 from dani.server import create_app
 from dani.service import DaniService
+from dani.signatures import build_signature
 from dani.storage import JsonStorage
 from tests.helpers import FakeGitHubCLI, FakeOmxRunner, FakeWorkLineManager
 
@@ -69,6 +70,11 @@ def test_github_webhook_alias_accepts_approve_comments(tmp_path: Path) -> None:
         work_line_manager=FakeWorkLineManager(),
     )
     service.register_repo("acme/demo", str(tmp_path))
+    github.add_issue_signature(
+        "acme/demo",
+        3,
+        build_signature(stage="issue_readiness_review", job="reviewer-3", issue=3, readiness="ready"),
+    )
     client = TestClient(create_app(service))
     payload = {
         "action": "created",

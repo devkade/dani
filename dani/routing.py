@@ -24,6 +24,7 @@ REVIEWER_FORBIDDEN_ACTIONS = (
 PLANNER_FORBIDDEN_ACTIONS = REVIEWER_FORBIDDEN_ACTIONS
 
 DEFAULT_ROLE_FOR_STAGE = {
+    "issue_readiness_review": ROLE_REVIEWER,
     "issue_request": ROLE_PLANNER,
     "issue_followup": ROLE_PLANNER,
     "issue_request_recovery": ROLE_PLANNER,
@@ -155,11 +156,11 @@ def parse_role_bindings(raw: object, *, agent_runtime: str) -> dict[str, AgentRo
 def route_event(event: NormalizedEvent, *, is_approve_comment: bool = False) -> RouteDecision | None:
     target = _target_metadata(event)
     if event.kind == "issue_opened":
-        return RouteDecision(ROLE_PLANNER, "issue_request", "issue_opened", target)
+        return RouteDecision(ROLE_REVIEWER, "issue_readiness_review", "issue_opened", target)
     if event.kind == "issue_comment" and is_approve_comment:
         return RouteDecision(ROLE_WORKER, "implementation", "issue_comment_approve", target)
     if event.kind == "issue_comment":
-        return RouteDecision(ROLE_PLANNER, "issue_followup", "issue_comment_non_approve", target)
+        return RouteDecision(ROLE_REVIEWER, "issue_readiness_review", "issue_comment_non_approve", target)
     if event.kind == "pull_request_opened" and event.action in PR_LIFECYCLE_ACTIONS:
         return RouteDecision(ROLE_REVIEWER, "review_round", f"pull_request_{event.action}", target)
     if event.kind == "check_status":

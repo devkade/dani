@@ -164,6 +164,9 @@ class _RepoScheduler:
             "worktree_path": job.metadata.get("worktree_path"),
             "branch_name": job.metadata.get("branch_name"),
         }
+        for key in ("issue_readiness_state", "launch_gate_state", "pr_review_state"):
+            if key in job.metadata:
+                snapshot[key] = job.metadata.get(key)
         if worker_name is not None:
             snapshot["worker_name"] = worker_name
         return snapshot

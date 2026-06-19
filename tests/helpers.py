@@ -242,13 +242,20 @@ class FakeOmxRunner:
             omx_session_id=f"omx-{job.id}",
         )
 
-    def _post_side_effect(self, repo_full_name: str, job: JobRecord, signature: dict[str, str] | None) -> None:
+    def _post_side_effect(self, repo_full_name: str, job: JobRecord, signature: dict[str, str] | None) -> None:  # noqa: C901
         if job.stage == "issue_request":
             issue_number = int((signature or {}).get("issue", job.issue_number or 0))
             self.github.add_issue_signature(
                 repo_full_name,
                 issue_number,
                 build_signature(stage="issue_request", job=job.id, issue=issue_number),
+            )
+        elif job.stage == "issue_readiness_review":
+            issue_number = int((signature or {}).get("issue", job.issue_number or 0))
+            self.github.add_issue_signature(
+                repo_full_name,
+                issue_number,
+                build_signature(stage="issue_readiness_review", job=job.id, issue=issue_number, readiness="ready"),
             )
         elif job.stage in {"issue_request_recovery", "issue_followup_recovery"}:
             self._post_recovery_side_effect(repo_full_name, job)

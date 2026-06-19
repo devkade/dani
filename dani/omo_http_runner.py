@@ -30,9 +30,11 @@ logger = logging.getLogger(__name__)
 ULTRAWORK_PROMPT_PREFIX = "ultrawork\n\n"
 COMMENT_ONLY_STAGES = frozenset({
     "issue_request",
+    "issue_readiness_review",
     "issue_followup",
     "issue_request_recovery",
     "issue_followup_recovery",
+    "issue_readiness_review_recovery",
 })
 DANI_OPENCODE_SERVER_URL_ENV = "DANI_OPENCODE_SERVER_URL"
 DANI_OPENCODE_PERMISSION_RESPONSE_ENV = "DANI_OPENCODE_PERMISSION_RESPONSE"

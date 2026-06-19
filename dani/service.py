@@ -35,6 +35,7 @@ from dani.models import (
 from dani.prompts import NON_INTERACTIVE_GUARD, ensure_non_interactive_guard, render_prompt, split_non_interactive_guard
 from dani.queue import RepoQueueManager
 from dani.routing import (
+    ROLE_PLANNER,
     AgentRoleBinding,
     default_forbidden_actions,
     default_role_for_stage,
@@ -57,14 +58,18 @@ INELIGIBLE_EXTERNAL_PR_COMMENT = (
 RETARGET_REQUEST_STAGE = "retarget_request"
 ISSUE_REQUEST_RECOVERY_STAGE = "issue_request_recovery"
 ISSUE_FOLLOWUP_RECOVERY_STAGE = "issue_followup_recovery"
+ISSUE_READINESS_REVIEW_RECOVERY_STAGE = "issue_readiness_review_recovery"
 CHECK_REVIEW_STAGE = "check_review"
+ISSUE_READINESS_REVIEW_STAGE = "issue_readiness_review"
 ISSUE_COMMENT_RECOVERY_STAGES = {
     ISSUE_REQUEST_RECOVERY_STAGE: "issue_request",
     ISSUE_FOLLOWUP_RECOVERY_STAGE: "issue_followup",
+    ISSUE_READINESS_REVIEW_RECOVERY_STAGE: ISSUE_READINESS_REVIEW_STAGE,
 }
 ISSUE_COMMENT_MISSING_ERRORS = {
     "issue-request-comment-missing",
     "issue-followup-comment-missing",
+    "issue-readiness-review-comment-missing",
 }
 MAX_COMMENT_RECOVERY_ATTEMPTS = 1
 
@@ -218,7 +223,7 @@ class DaniService:
             if "pull_request" in issue:
                 continue
             latest_signature = self.github.latest_signature_comment(repo_full_name, issue["number"], kind="issue")
-            if latest_signature is not None and latest_signature[1].get("stage") == "issue_request":
+            if latest_signature is not None and latest_signature[1].get("stage") == ISSUE_READINESS_REVIEW_STAGE:
                 continue
             event = NormalizedEvent(
                 kind="issue_opened",
@@ -322,7 +327,7 @@ class DaniService:
             return {"status": "ignored", "reason": "issue_closed"}
         if self.storage.is_terminal_issue(repo.full_name, event.number):
             return {"status": "ignored", "reason": "issue_terminal"}
-        return self._queue_issue_request(repo, event)
+        return self._queue_issue_readiness_review(repo, event)
 
     def _dispatch_approve_comment(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
         if event.issue_state == "closed":
@@ -398,23 +403,18 @@ class DaniService:
             return {"status": "ignored", "reason": "self_authored_comment"}
         if self._completed_followup_count(repo.full_name, event.number) >= self.config.max_issue_followups:
             return {"status": "ignored", "reason": "max_followups_reached"}
-        return self._queue_issue_followup(repo, event)
+        return self._queue_issue_readiness_review(repo, event)
 
     def _issue_readiness(self, repo_full_name: str, issue_number: int) -> str:
         latest = self.github.latest_signature_comment(repo_full_name, issue_number, kind="issue")
         if latest is None:
-            return "ready"
+            return "missing"
         _comment, signature = latest
         stage = str(signature.get("stage") or "")
-        if stage not in {"issue_request", "issue_followup", "issue_readiness"}:
+        if stage != ISSUE_READINESS_REVIEW_STAGE:
             return "missing"
-        raw = (
-            signature.get("readiness")
-            or signature.get("verdict")
-            or signature.get("status")
-            or "ready"
-        )
-        value = str(raw).strip().casefold().replace("-", "_")
+        raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
+        value = str(raw or "").strip().casefold().replace("-", "_")
         if value in {"ready", "approved", "approve", "ok"}:
             return "ready"
         if value in {"not_ready", "needs_refinement", "refine", "changes_requested"}:
@@ -423,7 +423,7 @@ class DaniService:
 
     def _signature_requests_refinement(self, signature: dict[str, str]) -> bool:
         stage = str(signature.get("stage") or "")
-        if stage not in {"issue_readiness", "issue_request", "issue_followup"}:
+        if stage != ISSUE_READINESS_REVIEW_STAGE:
             return False
         raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
         value = str(raw or "").strip().casefold().replace("-", "_")
@@ -448,6 +448,29 @@ class DaniService:
             actor_type=event.actor_type,
         )
         return self._queue_issue_refinement(repo, synthetic, readiness=self._issue_readiness(event.repo_full_name, issue_number))
+
+    def _handle_planner_refinement_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
+        issue_number = int(signature.get("issue") or event.number)
+        event_key = self._agent_event_key(signature)
+        if not self.storage.record_processed_event(event_key):
+            return {"status": "ignored", "reason": "duplicate_agent_event"}
+        repo = self.storage.get_repo(event.repo_full_name)
+        if repo is None:
+            return {"status": "ignored", "reason": "missing_repo"}
+        synthetic = NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name=event.repo_full_name,
+            action=event.action,
+            number=issue_number,
+            actor_login=event.actor_login,
+            payload=event.payload,
+            body=event.body,
+            title=event.title,
+            delivery_id=event.delivery_id,
+            issue_state=event.issue_state,
+            actor_type=event.actor_type,
+        )
+        return self._queue_issue_readiness_review(repo, synthetic)
 
     def _queue_issue_refinement(self, repo: RepoConfig, event: NormalizedEvent, *, readiness: str) -> dict[str, Any]:
         if self._completed_followup_count(repo.full_name, event.number) >= self.config.max_issue_followups:
@@ -475,9 +498,13 @@ class DaniService:
                 "bridge_source_runtime": session.bridge_source_runtime,
                 "bridge_source_session_id": session.bridge_source_session_id,
                 "readiness": readiness,
+                "issue_readiness_state": readiness,
+                "launch_gate_state": "blocked",
                 "refinement_reason": "issue_not_ready",
             },
-            **self._route_kwargs(event),
+            role=ROLE_PLANNER,
+            route_reason="issue_readiness_refinement",
+            target_metadata={"issue_number": event.number, "event_kind": event.kind, "event_action": event.action},
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
@@ -498,6 +525,7 @@ class DaniService:
                 "title": event.title or f"PR #{pr_number}",
                 "body": event.body or "",
                 "check_action": event.action,
+                "pr_review_state": "check_review_pending",
                 "check_status": event.payload.get("status"),
                 "check_conclusion": event.payload.get("conclusion"),
                 "commit_sha": event.commit_sha,
@@ -564,6 +592,9 @@ class DaniService:
 
         if event.kind == "issue_comment" and self._signature_requests_refinement(signature):
             return self._handle_issue_refinement_request(event, signature)
+        if stage == "issue_followup" and event.kind == "issue_comment":
+            return self._handle_planner_refinement_event(event, signature)
+
 
         if stage == "implementation" and event.kind == "pull_request_comment":
             return self._handle_implementation_agent_event(event, signature)
@@ -1560,7 +1591,7 @@ class DaniService:
         return False
 
     def _should_recover_missing_issue_comment(self, job: JobRecord, exc: Exception) -> bool:
-        return job.stage in {"issue_request", "issue_followup"} and str(exc) in ISSUE_COMMENT_MISSING_ERRORS
+        return job.stage in set(ISSUE_COMMENT_RECOVERY_STAGES.values()) and str(exc) in ISSUE_COMMENT_MISSING_ERRORS
 
     def _enqueue_comment_recovery(self, job: JobRecord, exc: Exception) -> bool:
         original_error = str(exc)
@@ -1586,8 +1617,16 @@ class DaniService:
         repo = self.storage.get_repo(job.repo_full_name)
         if repo is None or job.issue_number is None:
             return False
-        recovery_stage = ISSUE_REQUEST_RECOVERY_STAGE if job.stage == "issue_request" else ISSUE_FOLLOWUP_RECOVERY_STAGE
-        expected_signature = build_signature(stage=job.stage, job=job.id, issue=int(job.issue_number))
+        recovery_stage = {
+            "issue_request": ISSUE_REQUEST_RECOVERY_STAGE,
+            "issue_followup": ISSUE_FOLLOWUP_RECOVERY_STAGE,
+            ISSUE_READINESS_REVIEW_STAGE: ISSUE_READINESS_REVIEW_RECOVERY_STAGE,
+        }[job.stage]
+        expected_signature = (
+            build_signature(stage=job.stage, job=job.id, issue=int(job.issue_number), readiness="ready")
+            if job.stage == ISSUE_READINESS_REVIEW_STAGE
+            else build_signature(stage=job.stage, job=job.id, issue=int(job.issue_number))
+        )
         source_session = self.storage.find_latest_session(
             repo_full_name=job.repo_full_name,
             stage=job.stage,
@@ -1889,6 +1928,12 @@ class DaniService:
         pr_snapshot = self._pull_request_metadata(repo.full_name, pr_number) if pr_number else {}
         pr_title = pr_snapshot.get("title", job.metadata.get("title", f"PR #{pr_number}"))
         pr_body = pr_snapshot.get("body", job.metadata.get("body", ""))
+        if job.stage == ISSUE_READINESS_REVIEW_STAGE:
+            prompt = self._build_issue_readiness_review_prompt(
+                repo, job, issue_number, issue_title, issue_body, resolved_runtime
+            )
+            return self._apply_bridge_context(self._with_role_prompt_context(job, prompt), bridge_prompt)
+
         if job.stage == "issue_request":
             prompt = self._build_issue_request_prompt(
                 repo, job, issue_number, issue_title, issue_body, resolved_runtime
@@ -1976,6 +2021,9 @@ class DaniService:
         if job.stage == "implementation":
             self._verify_implementation_side_effect(repo, job)
             return
+        if job.stage == ISSUE_READINESS_REVIEW_STAGE:
+            self._verify_issue_readiness_review_side_effect(repo, job)
+            return
         if job.stage in {"review_round", CHECK_REVIEW_STAGE}:
             self._verify_review_round_side_effect(repo, job)
             return
@@ -2006,6 +2054,47 @@ class DaniService:
                 "issue_body": issue_body,
                 "discussion": self._render_issue_discussion(repo.full_name, issue_number),
                 "signature": build_signature(stage="issue_request", job=job.id, issue=issue_number),
+            },
+            runtime=runtime,
+        )
+
+    def _build_issue_readiness_review_prompt(
+        self,
+        repo: RepoConfig,
+        job: JobRecord,
+        issue_number: int,
+        issue_title: str,
+        issue_body: str,
+        runtime: str,
+    ) -> str:
+        return render_prompt(
+            "issue_readiness_review",
+            {
+                "repo": repo.full_name,
+                "local_path": repo.local_path,
+                "issue_number": issue_number,
+                "issue_title": issue_title,
+                "issue_body": issue_body,
+                "comment_body": job.metadata.get("comment_body", ""),
+                "discussion": self._render_issue_discussion(repo.full_name, issue_number),
+                "ready_signature": build_signature(
+                    stage=ISSUE_READINESS_REVIEW_STAGE,
+                    job=job.id,
+                    issue=issue_number,
+                    readiness="ready",
+                ),
+                "not_ready_signature": build_signature(
+                    stage=ISSUE_READINESS_REVIEW_STAGE,
+                    job=job.id,
+                    issue=issue_number,
+                    readiness="not_ready",
+                ),
+                "needs_refinement_signature": build_signature(
+                    stage=ISSUE_READINESS_REVIEW_STAGE,
+                    job=job.id,
+                    issue=issue_number,
+                    readiness="needs_refinement",
+                ),
             },
             runtime=runtime,
         )
@@ -2275,6 +2364,24 @@ class DaniService:
             job=job,
         )
 
+    def _verify_issue_readiness_review_side_effect(self, repo: RepoConfig, job: JobRecord) -> None:
+        issue_number = int(job.issue_number or 0)
+        comments = self.github.find_comments_by_signature(
+            repo.full_name,
+            issue_number,
+            kind="issue",
+            signature_fragment=f"stage={ISSUE_READINESS_REVIEW_STAGE};job={job.id};issue={issue_number}",
+        )
+        for comment in comments:
+            signature = parse_signature(comment.get("body", ""))
+            if signature is None:
+                continue
+            raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
+            value = str(raw or "").strip().casefold().replace("-", "_")
+            if value in {"ready", "approved", "approve", "ok", "not_ready", "needs_refinement", "refine", "changes_requested"}:
+                return
+        raise RuntimeError("issue-readiness-review-comment-missing")
+
     def _verify_issue_comment_recovery_side_effect(self, repo: RepoConfig, job: JobRecord) -> None:
         signature = str(job.metadata.get("expected_signature") or "")
         if not signature:
@@ -2488,6 +2595,23 @@ class DaniService:
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
+    def _queue_issue_readiness_review(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
+        job = self._enqueue_job(
+            repo,
+            stage=ISSUE_READINESS_REVIEW_STAGE,
+            issue_number=event.number,
+            metadata={
+                "title": event.title or "",
+                "body": event.payload.get("issue", {}).get("body", event.body or ""),
+                "comment_body": event.body or "",
+                "issue_readiness_state": "pending",
+                "launch_gate_state": "blocked",
+            },
+            **self._route_kwargs(event),
+        )
+        return {"status": "queued", "job_id": job.id, "stage": job.stage}
+
+
     def _queue_dev_sync(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
         if event.ref != f"refs/heads/{repo.main_branch}":
             return {"status": "ignored", "reason": "non_main_push"}
@@ -2549,6 +2673,8 @@ class DaniService:
             "body": event.payload.get("issue", {}).get("body", ""),
             "line_id": line_id,
             "issue_id": str(event.number),
+            "issue_readiness_state": "ready",
+            "launch_gate_state": "approved",
         }
         metadata = self._planned_work_line_metadata(
             repo,
@@ -2830,7 +2956,7 @@ class DaniService:
                 continue
             if session.issue_number != issue_number:
                 continue
-            if session.stage not in {"issue_request", "issue_followup"}:
+            if session.stage not in {ISSUE_READINESS_REVIEW_STAGE, "issue_request", "issue_followup"}:
                 continue
             if not session.omx_session_id:
                 continue
@@ -2874,6 +3000,7 @@ class DaniService:
                     **lineage_metadata,
                     "title": event.title or "",
                     "body": event.body or "",
+                    "pr_review_state": "review_round_1_pending",
                 },
                 **self._route_kwargs(event),
             )
@@ -2933,6 +3060,7 @@ class DaniService:
             "title": event.title or "",
             "body": event.body or "",
             **self._external_pr_metadata(event),
+            "pr_review_state": f"review_round_{next_review_round}_pending",
         }
         if untracked:
             metadata["untracked"] = True
