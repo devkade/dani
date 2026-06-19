@@ -1,8 +1,8 @@
 # dani
 
-Simple GitHub webhook -> agent automation loop. Supports three pluggable agent
+Simple GitHub webhook -> agent automation loop. Supports four pluggable agent
 runtimes: **Oh-My-Codex (`omx`, default)**, **Oh-My-OpenAgents (`omo`,
-opt-in)**, and **Gajae Code (`gjc`, opt-in)**.
+opt-in)**, **Gajae Code (`gjc`, opt-in)**, and **Hermes (`hermes`, opt-in)**.
 
 ## What v1 includes
 - Typer CLI
@@ -10,7 +10,8 @@ opt-in)**, and **Gajae Code (`gjc`, opt-in)**.
 - Registered repos only
 - Repo-serial / cross-repo parallel job handling
 - Pluggable agent runtime: non-interactive `omx exec` / `omx exec resume` (default),
-  HTTP-backed Oh-My-OpenAgents (`opencode serve`), or non-interactive GJC (`gjc -p`)
+  HTTP-backed Oh-My-OpenAgents (`opencode serve`), non-interactive GJC (`gjc -p`),
+  or non-interactive Hermes (`hermes chat -q`)
 - Separate prompt templates in `dani/prompts.py`
 - Workflows for:
   - issue request report
@@ -28,6 +29,7 @@ Required local tools (depending on the selected runtime):
 - `omx` — required when `DANI_AGENT_RUNTIME=omx` (default)
 - `opencode` — required when `DANI_AGENT_RUNTIME=omo`
 - `gjc` — required when `DANI_AGENT_RUNTIME=gjc`
+- `hermes` — required when `DANI_AGENT_RUNTIME=hermes`
 
 Required environment variables:
 - `DANI_WEBHOOK_SECRET`
@@ -38,6 +40,7 @@ Optional environment variables:
   - `omx` / `oh-my-codex` / `codex` (default)
   - `omo` / `oh-my-openagents` / `oh-my-openagent` / `opencode`
   - `gjc` / `gajae-code`
+  - `hermes`
 - `DANI_AGENT_TIMEOUT_SECONDS` — overrides the per-job agent wait timeout in seconds.
 - `DANI_ISSUE_READY_LAUNCH` — selects what happens after a reviewer marks an issue ready:
   - `manual` (default) waits for maintainer `/approve`.
@@ -47,15 +50,25 @@ Optional config file (`~/.dani/config.json` by default, or `<data-dir>/config.js
 
 ```json
 {
-  "agent_runtime": "gjc",
+  "agent_runtime": "omx",
   "agent_timeout_seconds": 3600,
-  "issue_ready_launch": "manual"
+  "issue_ready_launch": "manual",
+  "role_bindings": {
+    "reviewer": {"runtime": "hermes", "profile": "reviewer-profile"}
+  }
 }
 ```
 
 `agent_timeout_seconds` defaults to `3600`; `issue_ready_launch` defaults to
 `manual`. The corresponding environment variables take precedence over the
 config file when set.
+
+`role_bindings.<role>.runtime` overrides the global `agent_runtime` for that role.
+`role_bindings.<role>.profile` is a Hermes-only option: Dani passes it to
+`hermes -p <profile>` when that role's effective runtime is `hermes`, and ignores it
+for `omx`, `omo`, and `gjc` bindings. Reviewer stages (`issue_readiness_review`,
+`review_round`, `check_review`, and `final_verdict`) can be bound to a Hermes
+profile without changing worker or planner runtime bindings.
 
 When `DANI_AGENT_RUNTIME=omo` is selected, dani automatically prefixes every
 opencode prompt with the `ultrawork` keyword so oh-my-openagents' ultrawork
@@ -108,6 +121,13 @@ implementation jobs run ultragoal-style execution from that approved plan, and
 PR review jobs run a GJC quality-gate review. Runtime-specific prompt
 substitutions still replace Codex-only `$ralph` and `$code-review` tokens.
 
+## Hermes prerequisite
+When running with `DANI_AGENT_RUNTIME=hermes`, dani launches Hermes in
+non-interactive chat mode with `hermes chat -q`. A role binding can set
+`profile` to launch that role with `hermes -p <profile> chat -q`; configure the
+profile in Hermes first. Dani does not resume Hermes sessions yet, so follow-up
+jobs start fresh unless another runtime handles the lineage.
+
 ## CLI
 ```bash
 dani register-repo owner/name /absolute/path/to/repo
@@ -154,7 +174,7 @@ dani doctor --json --output /tmp/dani-report.json
 | Name | Description |
 |---|---|
 | `config_env` | webhook secret, GitHub token, agent runtime, config.json parse status |
-| `binaries` | `git`, `gh`, plus runtime-specific `omx`/`codex`, `opencode`, or `gjc` (skips opencode if `DANI_OPENCODE_SERVER_URL` is set) |
+| `binaries` | `git`, `gh`, plus runtime-specific `omx`/`codex`, `opencode`, `gjc`, or `hermes` (skips opencode if `DANI_OPENCODE_SERVER_URL` is set) |
 | `storage_files` | parse-ability of `registry.json`/`jobs.json`/`sessions.json`/`processed-events.json`/`terminal-targets.json`; tolerates one transient parse error per file plus an `events.jsonl` last-line append race |
 | `registered_repos` | each registered repo's `local_path` is a git working tree and resolves both `main_branch` and `dev_branch` |
 | `github_auth` | resolves the GitHub token, verifies it with the minimum `Github.get_rate_limit()` call, reports rate-limit headroom; never echoes the token, only its source env-var name |
@@ -198,7 +218,7 @@ State is stored under `~/.dani/` by default:
 - `jobs.json`
 - `sessions.json`
 - `events.jsonl`
-- `runs/` for generated agent-runtime prompt/script artifacts (omx, omo, or gjc)
+- `runs/` for generated agent-runtime prompt/script artifacts (omx, omo, gjc, or hermes)
 
 
 ## GitHub surfaces

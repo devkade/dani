@@ -9,6 +9,7 @@ from uuid import uuid4
 RUNTIME_OMX = "omx"
 RUNTIME_OMO = "omo"
 RUNTIME_GJC = "gjc"
+RUNTIME_HERMES = "hermes"
 DEFAULT_AGENT_TIMEOUT_SECONDS = 3600.0
 
 
@@ -80,6 +81,7 @@ class SessionRecord:
     fallback_reason: str | None = None
     bridge_source_runtime: str | None = None
     bridge_source_session_id: str | None = None
+    hermes_profile: str | None = None
     id: str = field(default_factory=lambda: uuid4().hex)
     status: str = "launched"
     ended_at: str | None = None

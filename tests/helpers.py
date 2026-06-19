@@ -368,7 +368,14 @@ class FakeRuntimeRunner(FakeOmxRunner):
     def __init__(self, github: FakeGitHubCLI, *, runtime_name: str) -> None:
         super().__init__(github)
         self.runtime_name = runtime_name
-        self.session_id_prefix = "ses_" if runtime_name == "omo" else "gjc-" if runtime_name == "gjc" else "omx-"
+        if runtime_name == "omo":
+            self.session_id_prefix = "ses_"
+        elif runtime_name == "gjc":
+            self.session_id_prefix = "gjc-"
+        elif runtime_name == "hermes":
+            self.session_id_prefix = ""
+        else:
+            self.session_id_prefix = "omx-"
         self.wait_errors: list[Exception] = []
 
     def queue_wait_error(self, exc: Exception) -> None:
@@ -383,6 +390,7 @@ class FakeRuntimeRunner(FakeOmxRunner):
         if self._transient_failures_remaining == 0 and not should_skip_side_effect:
             self._post_side_effect(repo_full_name, job, signature)
         self.launches.append({"repo_path": str(repo_path), "job": job, "prompt": prompt})
+        omx_session_id = None if self.runtime_name == "hermes" else f"{self.session_id_prefix}{job.id}"
         return SessionRecord(
             repo_full_name=repo_full_name,
             stage=job.stage,
@@ -395,7 +403,8 @@ class FakeRuntimeRunner(FakeOmxRunner):
             issue_number=job.issue_number,
             pr_number=job.pr_number,
             review_round=job.review_round,
-            omx_session_id=f"{self.session_id_prefix}{job.id}",
+            omx_session_id=omx_session_id,
+            hermes_profile=job.metadata.get("hermes_profile") if self.runtime_name == "hermes" else None,
         )
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str) -> SessionRecord:
@@ -439,10 +448,17 @@ class FakeRuntimeRunner(FakeOmxRunner):
         return super().wait(runtime_handle, poll_interval=poll_interval, timeout_seconds=timeout_seconds)
 
     def get_session_id(self, runtime_handle: str) -> str | None:
+        if self.runtime_name == "hermes":
+            return None
         suffix = runtime_handle.removeprefix(f"{self.runtime_name}-runtime-")
         if not suffix:
             return None
         return f"{self.session_id_prefix}{suffix}"
+
+    def can_resume(self, session_id: str) -> bool:
+        if self.runtime_name == "hermes":
+            return False
+        return super().can_resume(session_id)
 
 
 class FakeGitDevSyncer:
