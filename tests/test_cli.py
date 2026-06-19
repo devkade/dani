@@ -174,6 +174,32 @@ def test_build_config_reads_issue_ready_launch_from_config_file(tmp_path: Path, 
     assert config.issue_ready_launch == "auto"
 
 
+def test_build_config_reads_nested_issue_launch_auto_flag(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(
+        json.dumps({"issue_launch": {"auto_launch_on_ready": True}}), encoding="utf-8"
+    )
+    monkeypatch.delenv("DANI_ISSUE_READY_LAUNCH", raising=False)
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.issue_ready_launch == "auto"
+
+
+def test_build_config_issue_ready_launch_env_overrides_nested_issue_launch(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(
+        json.dumps({"issue_launch": {"auto_launch_on_ready": True}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("DANI_ISSUE_READY_LAUNCH", "manual")
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.issue_ready_launch == "manual"
+
+
 def test_build_config_reads_issue_ready_launch_from_env(tmp_path: Path, monkeypatch) -> None:
     data_dir = tmp_path / ".dani"
     data_dir.mkdir()

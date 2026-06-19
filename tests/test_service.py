@@ -563,7 +563,58 @@ def test_reviewer_ready_signature_auto_launches_worker_when_configured(tmp_path:
     assert omx_runner.launches[-1]["job"].stage == "implementation"
 
 
-def test_check_status_queues_reviewer_check_review(tmp_path: Path) -> None:
+def test_approve_command_must_be_line_level_command(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    add_ready_issue_signature(github, "acme/demo", 47)
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=47,
+            actor_login="maintainer",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="Please do not treat this quoted text as approval: `/approve`.",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["status"] in {"queued", "ignored"}
+    assert result.get("stage") != "implementation"
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=47) == []
+    assert all(launch["job"].stage != "implementation" for launch in omx_runner.launches)
+
+
+def test_approve_uses_latest_readiness_signature_even_after_planner_comment(tmp_path: Path) -> None:
+    service, github, _ = make_service(tmp_path)
+    add_ready_issue_signature(github, "acme/demo", 48)
+    github.create_issue_comment(
+        "acme/demo",
+        48,
+        build_signature(stage="issue_followup", job="planner-job", issue=48),
+    )
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=48,
+            actor_login="maintainer",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+
+    assert result["stage"] == "implementation"
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=48)
+
+
+def test_check_status_prompt_includes_check_review_mode_note(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
 
     result = service.handle_event(
@@ -589,6 +640,8 @@ def test_check_status_queues_reviewer_check_review(tmp_path: Path) -> None:
     assert job.role == "reviewer"
     assert job.metadata["route_reason"] == "check_status_completed"
     assert omx_runner.launches[-1]["job"].stage == "check_review"
+    assert "Check-status review mode" in omx_runner.launches[-1]["prompt"]
+    assert "missing evidence" in omx_runner.launches[-1]["prompt"]
 
 
 def test_issue_request_verification_requires_exact_signature(tmp_path: Path) -> None:

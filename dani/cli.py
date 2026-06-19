@@ -129,9 +129,19 @@ def _resolve_repo_concurrency(config_payload: dict[str, object]) -> int:
     return _parse_positive_int(value, name="repo_concurrency")
 
 def _resolve_issue_ready_launch(config_payload: dict[str, object]) -> str:
-    value = os.environ.get("DANI_ISSUE_READY_LAUNCH") or config_payload.get(
-        "issue_ready_launch", ISSUE_READY_LAUNCH_MANUAL
-    )
+    value = os.environ.get("DANI_ISSUE_READY_LAUNCH")
+    if value is None:
+        value = config_payload.get("issue_ready_launch")
+    if value is None:
+        issue_launch = config_payload.get("issue_launch")
+        if isinstance(issue_launch, dict):
+            typed_issue_launch = cast(dict[str, object], issue_launch)
+            if bool(typed_issue_launch.get("auto_launch_on_ready")):
+                value = "auto"
+            else:
+                value = typed_issue_launch.get("mode") or typed_issue_launch.get("ready_launch")
+    if value is None:
+        value = ISSUE_READY_LAUNCH_MANUAL
     launch = str(value).strip().casefold().replace("-", "_")
     aliases = {
         "manual_approve": ISSUE_READY_LAUNCH_MANUAL,

@@ -415,14 +415,22 @@ class DaniService:
         return self._queue_issue_followup(repo, event)
 
     def _issue_readiness(self, repo_full_name: str, issue_number: int) -> str:
-        latest = self.github.latest_signature_comment(repo_full_name, issue_number, kind="issue")
-        if latest is None:
-            return "missing"
-        _comment, signature = latest
-        stage = str(signature.get("stage") or "")
-        if stage != ISSUE_READINESS_REVIEW_STAGE:
-            return "missing"
-        return self._readiness_from_signature(signature)
+        """Return the latest explicit issue-readiness verdict.
+
+        Only `issue_readiness_review` signatures can drive the launch gate. A later
+        planner or worker signature may appear in the issue discussion, but it must
+        not accidentally erase the most recent reviewer readiness verdict.
+        """
+        for comment in reversed(self.github.issue_comments(repo_full_name, issue_number)):
+            if is_opt_out_comment(str(comment.get("body") or "")):
+                continue
+            signature = parse_signature(str(comment.get("body") or ""))
+            if signature is None:
+                continue
+            stage = str(signature.get("stage") or "")
+            if stage == ISSUE_READINESS_REVIEW_STAGE:
+                return self._readiness_from_signature(signature)
+        return "missing"
 
     def _signature_requests_refinement(self, signature: dict[str, str]) -> bool:
         stage = str(signature.get("stage") or "")
@@ -2278,6 +2286,7 @@ class DaniService:
                 "issue_title": issue_title,
                 "issue_body": issue_body,
                 "comment_body": job.metadata.get("comment_body", ""),
+                "discussion": self._render_issue_discussion(repo.full_name, issue_number),
                 "signature": build_signature(stage="issue_followup", job=job.id, issue=issue_number),
             },
             runtime=runtime,
@@ -2357,6 +2366,14 @@ class DaniService:
         pr_discussion = self._render_pr_discussion(repo.full_name, pr_number)
         if pr_discussion:
             discussion_parts.append(pr_discussion)
+        review_mode_note = ""
+        if job.stage == CHECK_REVIEW_STAGE:
+            review_mode_note = (
+                "Check-status review mode:\n"
+                "- Focus first on the changed check/status result and whether it changes the prior reviewer verdict.\n"
+                "- Re-open full PR review only if the check result exposes new implementation, evidence, or SSOT risk.\n"
+                "- If checks are absent or inconclusive, state that explicitly as missing evidence."
+            )
         return render_prompt(
             "review_round",
             {
@@ -2367,7 +2384,7 @@ class DaniService:
                 "discussion": "\n\n".join(discussion_parts),
                 "round_number": job.review_round or 1,
                 "round_total": self.config.review_rounds,
-                "review_mode_note": "",
+                "review_mode_note": review_mode_note,
                 "signature": build_signature(**signature_fields),
             },
             runtime=runtime,
@@ -2634,8 +2651,15 @@ class DaniService:
             history.append(note)
             job.metadata["duplicate_signature_prunes"] = history
 
+    _APPROVE_COMMAND_PATTERN = re.compile(r"(?im)^\s*/approve(?:\s|$)")
+
     def _is_approve_comment(self, body: str | None) -> bool:
-        return bool(body and "/approve" in body.lower())
+        """Return True only for a line-level `/approve` command.
+
+        This avoids treating quoted logs, prose, or checklist text containing the
+        substring `/approve` as launch authorization.
+        """
+        return bool(body and self._APPROVE_COMMAND_PATTERN.search(body))
 
     def _is_merge_conflict_resolution_request(self, body: str | None) -> bool:
         if not body:

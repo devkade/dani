@@ -355,6 +355,7 @@ def _issue_followup_context() -> dict[str, object]:
         "issue_title": "Need a bot",
         "issue_body": "Implement it",
         "comment_body": "User clarification",
+        "discussion": "Earlier reviewer blocker",
         "signature": "<!-- dani:stage=issue_followup;job=abc;issue=7 -->",
     }
 
@@ -366,6 +367,7 @@ def test_issue_request_prompt_declares_planning_only_role() -> None:
     assert "DO NOT write code" in prompt
     assert "your session ENDS" in prompt
     assert "/approve" in prompt
+    assert "Planner refinement output contract" in prompt
     assert "NEW, SEPARATE worker session" in prompt
 
 
@@ -377,12 +379,13 @@ def test_issue_request_prompt_forbids_self_handoff_promises() -> None:
     assert "does not inherit your reasoning trace" in prompt
 
 
-def test_issue_request_prompt_checklist_mentions_approve_gate_and_async_decisions() -> None:
+def test_issue_request_prompt_checklist_mentions_launch_gate_and_async_decisions() -> None:
     prompt = render_prompt("issue_request", _issue_request_context())
 
-    assert "Assumptions / human decisions to resolve asynchronously before /approve" in prompt
+    assert "Assumptions / human decisions to resolve asynchronously before the configured launch gate" in prompt
     assert "Open questions for the human" not in prompt
-    assert 'implementation starts only after a human comment containing "/approve"' in prompt
+    assert "reviewer-ready plus the configured launch gate" in prompt
+    assert 'implementation starts only after a human comment containing "/approve"' not in prompt
 
 
 def test_issue_followup_prompt_declares_planning_only_role() -> None:
@@ -392,12 +395,13 @@ def test_issue_followup_prompt_declares_planning_only_role() -> None:
     assert "DO NOT write code" in prompt
 
 
-def test_issue_followup_prompt_mentions_async_decisions_not_open_questions() -> None:
+def test_issue_followup_prompt_mentions_launch_gate_decisions_not_open_questions() -> None:
     prompt = render_prompt("issue_followup", _issue_followup_context())
 
-    assert 'assumptions / human decisions to resolve asynchronously before "/approve"' in prompt
+    assert "assumptions / human decisions to resolve asynchronously before the configured launch gate" in prompt.lower()
     assert "remaining open questions" not in prompt
-    assert "/approve" in prompt
+    assert "reviewer-ready plus the configured launch gate" in prompt
+    assert "Earlier reviewer blocker" in prompt
     assert "NEW, SEPARATE worker session" in prompt
 
 
@@ -438,6 +442,8 @@ def test_review_round_prompt_requires_code_review_and_verification() -> None:
 
     assert "$code-review" in prompt
     assert "actual verification" in prompt.lower()
+    assert "SSOT alignment review protocol" in prompt
+    assert "aligned, needs-review, drifting, misaligned, blocked" in prompt
     assert "concrete evidence appropriate for what you verified" in prompt
     assert "gh pr comment 5 --repo acme/demo --body-file <review-comment.md>" in prompt
 
@@ -601,6 +607,16 @@ def test_issue_followup_prompt_for_gjc_uses_ralplan_revision() -> None:
     assert "ralplan-style revision pass" in prompt
     assert "Do not implement" in prompt
     assert "revised pending-approval handoff" in prompt
+
+
+def test_issue_readiness_review_prompt_uses_ssot_alignment_contract() -> None:
+    prompt = render_prompt("issue_readiness_review", _issue_readiness_review_context())
+
+    assert "SSOT alignment review protocol" in prompt
+    assert "Reviewer output contract" in prompt
+    assert "Bottom line with readiness verdict" in prompt
+    assert "aligned, needs-review, drifting, misaligned, blocked" in prompt
+    assert "planner handoff with exact blockers" in prompt
 
 
 def test_issue_readiness_review_prompt_for_gjc_acts_as_approval_gate() -> None:

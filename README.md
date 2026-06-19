@@ -14,8 +14,8 @@ opt-in)**, **Gajae Code (`gjc`, opt-in)**, and **Hermes (`hermes`, opt-in)**.
   or non-interactive Hermes (`hermes chat -q`)
 - Separate prompt templates in `dani/prompts.py`
 - Workflows for:
-  - issue request report
-  - `/approve` implementation
+  - reviewer-first issue readiness review with planner refinement loops
+  - reviewer-ready launch gates: manual `/approve` or configured auto-launch
   - 3 review rounds for agent-authored PRs
   - PR-comment-triggered merge conflict resolution via `/resolve-conflict`,
     `/resolve merge conflict`, `/solve merge conflict`, or `solve merge conflict`
@@ -53,6 +53,9 @@ Optional config file (`~/.dani/config.json` by default, or `<data-dir>/config.js
   "agent_runtime": "omx",
   "agent_timeout_seconds": 3600,
   "issue_ready_launch": "manual",
+  "issue_launch": {
+    "auto_launch_on_ready": false
+  },
   "role_bindings": {
     "reviewer": {"runtime": "hermes", "profile": "reviewer-profile"}
   }
@@ -61,7 +64,10 @@ Optional config file (`~/.dani/config.json` by default, or `<data-dir>/config.js
 
 `agent_timeout_seconds` defaults to `3600`; `issue_ready_launch` defaults to
 `manual`. The corresponding environment variables take precedence over the
-config file when set.
+config file when set. `issue_launch.auto_launch_on_ready` is accepted as the
+structured equivalent of `issue_ready_launch: "auto"`; the flat
+`issue_ready_launch` key and `DANI_ISSUE_READY_LAUNCH` environment variable take
+precedence when present.
 
 `role_bindings.<role>.runtime` overrides the global `agent_runtime` for that role.
 `role_bindings.<role>.profile` is a Hermes-only option: Dani passes it to

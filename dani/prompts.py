@@ -22,6 +22,32 @@ NON_INTERACTIVE_GUARD = (
 )
 
 
+SSOT_REVIEW_PROTOCOL = (
+    "SSOT alignment review protocol:\n"
+    "- Read the live issue/PR body, visible discussion, and any canonical SSOT before judging readiness or mergeability.\n"
+    "- Compare claims against accepted direction, constraints, non-goals, launch gates, and evidence requirements.\n"
+    "- Classify important findings with this vocabulary: aligned, needs-review, drifting, misaligned, blocked.\n"
+    "- Cite concrete evidence: issue/PR text, comment history, file paths, test/check output, or explicit missing evidence.\n"
+    "- Do not replace stale or conflicting SSOT text silently; mark unresolved contradictions as needs-review or blocked.\n"
+)
+
+REVIEWER_ALIGNMENT_OUTPUT_CONTRACT = (
+    "Reviewer output contract:\n"
+    "- Include a Bottom line with the readiness/review verdict.\n"
+    "- Include Canonical direction, Alignment review, Evidence checked, Blockers, and Recommended next action.\n"
+    "- If not ready or not mergeable, name the planner/worker evidence needed without giving patch diffs unless explicitly requested.\n"
+    "- Reviewer may comment and classify; reviewer must not implement, create branches, open PRs, merge, close, relabel, force-push, or delete.\n"
+)
+
+PLANNER_REFINEMENT_OUTPUT_CONTRACT = (
+    "Planner refinement output contract:\n"
+    "- Address reviewer blockers and owner follow-ups as a self-contained issue handoff.\n"
+    "- Include Refinement summary, Reviewer blockers addressed, Acceptance criteria / verification steps, Remaining assumptions or human decisions, and Recommended next reviewer action.\n"
+    "- Use planner-local classifications when useful: resolved-for-review, needs-human-decision, scope-split-recommended, blocked-by-ssot-conflict.\n"
+    "- Planner must not implement, create branches, open PRs, merge, close, relabel, force-push, or delete.\n"
+)
+
+
 TEMPLATES = {
     "issue_readiness_review": Template(
         """
@@ -34,7 +60,10 @@ ROLE: REVIEWER READINESS AGENT (read-only gatekeeper, no implementation).
 - You DO NOT write code, create branches, open PRs, merge, close issues, or change labels.
 - If the request is clear and safe to implement, mark it ready.
 - If requirements are missing, contradictory, unsafe, or need more planning, mark it not_ready or needs_refinement.
-- A worker implementation may launch only after your latest issue comment carries the ready signature below.
+- A worker implementation may launch only after your latest issue comment carries the ready signature below and the configured launch gate allows it.
+
+$ssot_review_protocol
+$reviewer_output_contract
 $runtime_stage_instructions
 
 Issue body:
@@ -48,9 +77,11 @@ $discussion
 
 Write exactly one GitHub issue comment.
 Checklist:
-- [ ] Readiness verdict: ready, not_ready, or needs_refinement
-- [ ] Short reason with concrete blockers or approval rationale
-- [ ] If not ready, clear instructions for the planner refinement pass
+- [ ] Bottom line with readiness verdict: ready, not_ready, or needs_refinement
+- [ ] Canonical direction: goal, constraints/gates, and evidence required
+- [ ] Alignment review using aligned, needs-review, drifting, misaligned, blocked
+- [ ] Evidence checked, including explicit missing evidence if applicable
+- [ ] If not ready, planner handoff with exact blockers and clarification needed
 - [ ] Exactly one Agent Signature, selected from the signatures below
 
 Use exactly one of these signatures:
@@ -83,9 +114,11 @@ Task: review GitHub issue #$issue_number titled "$issue_title".
 ROLE: PLANNING AGENT (read-only analysis, no implementation).
 - You analyze and propose a plan. You DO NOT write code, create branches, or open PRs in this session.
 - After you post the comment, your session ENDS. dani discards your in-memory state.
-- Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
+- Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch, depending on repo config). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
 - Do NOT promise to "create a PR", "open a branch", "write the code", "push commits", or "do the work next". Phrase the plan as "the implementation agent will...".
 - Your comment is the entire handoff. Make it self-contained: anything the implementation agent must know has to be IN the comment text.
+
+$planner_output_contract
 $runtime_stage_instructions
 
 Issue body:
@@ -108,8 +141,8 @@ Checklist:
 - [ ] Why this issue may not be needed
 - [ ] Expected Outcome
 - [ ] Evidence-based implementation plan (phrased as instructions for the implementation agent)
-- [ ] Assumptions / human decisions to resolve asynchronously before /approve (if any)
-- [ ] Reminder that implementation starts only after a human comment containing "/approve"
+- [ ] Assumptions / human decisions to resolve asynchronously before the configured launch gate (if any)
+- [ ] Reminder that implementation starts only after reviewer-ready plus the configured launch gate (manual `/approve` or auto launch, depending on repo config)
 - [ ] Agent Signature
 
 For the "Evidence-based implementation plan" section, report:
@@ -143,13 +176,18 @@ Issue title: $issue_title
 ROLE: PLANNING AGENT (read-only analysis, no implementation).
 - You refine the plan based on the new comment. You DO NOT write code, create branches, or open PRs in this session.
 - After you post the comment, your session ENDS. dani discards your in-memory state.
-- Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
+- Implementation only starts after a reviewer-ready verdict and the configured launch gate (manual `/approve` or auto launch, depending on repo config). At that point dani spawns a NEW, SEPARATE worker session in a fresh process. That worker does not inherit your reasoning trace — it only sees the issue body and the GitHub discussion.
 - Do NOT promise to "create a PR", "open a branch", "write the code", "push commits", or "do the work next". Phrase next steps as "the implementation agent will...".
 - Your comment is the entire handoff. Make it self-contained: anything the implementation agent must know has to be IN the comment text or in earlier visible discussion.
+
+$planner_output_contract
 $runtime_stage_instructions
 
 Original issue body:
 $issue_body
+
+Existing issue discussion history:
+$discussion
 
 New user follow-up comment:
 $comment_body
@@ -158,8 +196,8 @@ Continue the existing issue discussion instead of restarting the analysis from s
 Write exactly one GitHub issue comment that addresses the new follow-up. The comment must:
 - Answer or clarify the user's follow-up directly.
 - Update the implementation plan if the follow-up changes scope/approach.
-- Note any assumptions / human decisions to resolve asynchronously before "/approve".
-- Remind the human that implementation starts only after a comment containing "/approve".
+- Note any assumptions / human decisions to resolve asynchronously before the configured launch gate.
+- Remind the human that implementation starts only after reviewer-ready plus the configured launch gate (manual `/approve` or auto launch, depending on repo config).
 - Include this exact signature on its own line:
 $signature
 
@@ -223,13 +261,18 @@ Recent discussion:
 $discussion
 
 $review_mode_note
+$ssot_review_protocol
+$reviewer_output_contract
 $runtime_stage_instructions
 Use the code locally and run $$code-review before writing the review comment.
 Do real verification, not only static inspection.
 Checklist:
+- [ ] Bottom line: changes_requested, no_blockers_found, or needs-review
 - [ ] Use $$code-review
+- [ ] SSOT alignment and evidence checked
 - [ ] Run the code or tests needed to validate behavior
 - [ ] Include Real Result from actual verification
+- [ ] Include blockers for the worker and non-blocking notes separately
 - [ ] Include concrete evidence appropriate for what you verified
 - [ ] Include this exact signature: $signature
 
@@ -282,10 +325,13 @@ $pr_body
 Review history:
 $discussion
 
+$ssot_review_protocol
+$reviewer_output_contract
 $runtime_stage_instructions
 Leave exactly one GitHub PR comment for this review pass.
 Checklist:
-- [ ] Verdict: APPROVE or REJECT
+- [ ] Final verdict: APPROVE or REJECT
+- [ ] Mergeability basis; APPROVE means reviewer sees no blockers, not that the PR was merged
 - [ ] Short reason
 - [ ] Real Result from actual verification
 - [ ] Include concrete evidence appropriate for what you verified
@@ -410,8 +456,12 @@ def render_prompt(template_name: str, context: dict[str, Any], *, runtime: str =
     template = TEMPLATES[template_name]
     context = dict(context)
     context.setdefault("review_cycle", "")
+    context.setdefault("ssot_review_protocol", SSOT_REVIEW_PROTOCOL)
+    context.setdefault("reviewer_output_contract", REVIEWER_ALIGNMENT_OUTPUT_CONTRACT)
+    context.setdefault("planner_output_contract", PLANNER_REFINEMENT_OUTPUT_CONTRACT)
     context.setdefault("round_total", "3")
     context.setdefault("review_mode_note", "")
+    context.setdefault("discussion", "")
     context.setdefault("branch_name", "")
     runtime_key = (runtime or "omx").strip().lower()
     context.setdefault(
