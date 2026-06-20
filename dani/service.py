@@ -79,6 +79,20 @@ RETRY_BACKOFF_SECONDS: list[int] = [60, 180, 600]
 
 logger = logging.getLogger(__name__)
 FINAL_VERDICT_MERGE_STAGE = "final_verdict_merge"
+REVIEW_ROUND_NO_BLOCKERS_VALUES = frozenset({"/approve", "no_blockers_found", "no blockers found", "no blockers"})
+REVIEW_ROUND_CHANGES_REQUESTED_VALUES = frozenset({
+    "changes_requested",
+    "changes requested",
+    "requested changes",
+    "needs changes",
+    "change requested",
+    "please fix",
+    "must fix",
+    "needs fix",
+    "fix the",
+    "blocker",
+    "blocking",
+})
 
 
 class DaniService:
@@ -954,6 +968,15 @@ class DaniService:
         self._update_work_line_state(source_job, status="merged", auto_merge_state="merged", retryable=False)
         self._cleanup_work_line_after_merge(source_job)
 
+    def _classify_review_round_outcome(self, body: str) -> str:
+        normalized = re.sub(r"[_\-\s]+", " ", body.casefold())
+        underscored = re.sub(r"[\-\s]+", "_", body.casefold())
+        if any(value in normalized or value in underscored for value in REVIEW_ROUND_NO_BLOCKERS_VALUES):
+            return "no_blockers_found"
+        if any(value in normalized or value in underscored for value in REVIEW_ROUND_CHANGES_REQUESTED_VALUES):
+            return "changes_requested"
+        return "unclear"
+
     def _handle_review_round_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         event_key = self._agent_event_key(signature, default_pr=event.number if event.is_pull_request else None)
         if not self.storage.record_processed_event(event_key):
@@ -971,10 +994,26 @@ class DaniService:
             return {"status": "ignored", "reason": "pr_not_open"}
         pr_metadata = self._pull_request_metadata(event.repo_full_name, pr_number)
         lineage_metadata = self._automation_lineage_metadata(source_job)
-        if issue_number is None:
-            return {"status": "ignored", "reason": "untracked_pr"}
-        if not self._is_pr_open(event.repo_full_name, pr_number):
-            return {"status": "ignored", "reason": "pr_not_open"}
+        review_outcome = self._classify_review_round_outcome(event.body or "")
+        if review_outcome == "no_blockers_found":
+            verdict_job = self._enqueue_job(
+                repo,
+                stage="final_verdict",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                metadata={
+                    **pr_metadata,
+                    **lineage_metadata,
+                    "title": (pr_metadata.get("title") or event.title or ""),
+                    "review_comment_body": event.body or "",
+                    "triggering_review_round": review_round,
+                    "review_round_outcome": review_outcome,
+                },
+            )
+            return {"status": "queued", "job_id": verdict_job.id, "stage": verdict_job.stage}
+        if review_outcome == "unclear":
+            return {"status": "ignored", "reason": "unclear_review_verdict"}
+
         next_job = self._enqueue_job(
             repo,
             stage="implementation",
@@ -987,6 +1026,7 @@ class DaniService:
                 "title": (pr_metadata.get("title") or event.title or ""),
                 "review_comment_body": event.body or "",
                 "triggering_review_round": review_round,
+                "review_round_outcome": review_outcome,
             },
         )
         return {"status": "queued", "job_id": next_job.id, "stage": next_job.stage}
@@ -1123,6 +1163,9 @@ class DaniService:
             return
 
         if job.stage == "implementation":
+            if job.pr_number and not self._is_pr_open(job.repo_full_name, int(job.pr_number)):
+                job.metadata = {**job.metadata, "skip_reason": "pr_not_open"}
+                return
             self._ensure_work_line(repo, job)
 
         preferred_runtime = self._preferred_runtime_for(job)
@@ -3354,7 +3397,7 @@ class DaniService:
 
     def _is_pr_open(self, repo_full_name: str, pr_number: int) -> bool:
         pull_request = self.github.get_pull_request(repo_full_name, pr_number)
-        return pull_request.get("state") == "open"
+        return pull_request.get("state") == "open" and pull_request.get("merged") is not True
 
     def _pull_request_metadata(self, repo_full_name: str, pr_number: int) -> dict[str, str]:
         for pull_request in self.github.list_pull_requests(repo_full_name):
