@@ -2089,6 +2089,22 @@ def test_negated_approval_command_with_blocker_routes_to_implementation(tmp_path
     assert service._classify_review_round_outcome(review_body) == "changes_requested"
 
 
+def test_explicit_no_blockers_verdict_ignores_negated_fix_language(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+
+    review_body = "Bottom line: no_blockers_found\nNo need to fix the worker path; it is verified."
+
+    assert service._classify_review_round_outcome(review_body) == "no_blockers_found"
+
+
+def test_explicit_no_blockers_verdict_ignores_historical_fix_language(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+
+    review_body = "Verdict: no_blockers_found\nPrevious review said must fix routing, now resolved."
+
+    assert service._classify_review_round_outcome(review_body) == "no_blockers_found"
+
+
 def test_unclear_review_round_does_not_launch_worker(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
     add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)

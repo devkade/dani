@@ -969,6 +969,10 @@ class DaniService:
         self._cleanup_work_line_after_merge(source_job)
 
     def _classify_review_round_outcome(self, body: str) -> str:
+        scoped_verdict = self._classify_scoped_review_round_verdict(body)
+        if scoped_verdict != "unclear":
+            return scoped_verdict
+
         normalized = re.sub(r"[_\-\s]+", " ", body.casefold())
         underscored = re.sub(r"[\-\s]+", "_", body.casefold())
 
@@ -981,6 +985,22 @@ class DaniService:
             return "changes_requested"
         if any(value in normalized or value in underscored for value in REVIEW_ROUND_NO_BLOCKERS_VALUES):
             return "no_blockers_found"
+        return "unclear"
+
+    def _classify_scoped_review_round_verdict(self, body: str) -> str:
+        for line in body.splitlines():
+            if not re.match(r"^\s*(?:bottom line|verdict)\s*:", line, flags=re.IGNORECASE):
+                continue
+            normalized = re.sub(r"[_\-\s]+", " ", line.casefold())
+            underscored = re.sub(r"[\-\s]+", "_", line.casefold())
+            if any(
+                value in normalized or value in underscored
+                for value in REVIEW_ROUND_CHANGES_REQUESTED_VALUES
+                if value not in {"blocker", "blocking"}
+            ) or bool(re.search(r"(?<!no )\bblockers?\b|(?<!no )(?<!not )\bblocking\b", normalized)):
+                return "changes_requested"
+            if any(value in normalized or value in underscored for value in REVIEW_ROUND_NO_BLOCKERS_VALUES):
+                return "no_blockers_found"
         return "unclear"
 
     def _handle_review_round_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
