@@ -2035,6 +2035,60 @@ def test_changes_requested_review_round_routes_to_implementation(tmp_path: Path)
     assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101) == []
 
 
+def test_mixed_review_round_markers_keep_changes_requested_on_implementation_path(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
+        )
+    )
+    service.wait_for_idle()
+    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
+
+    review_body = (
+        "Verdict: changes_requested\n\n"
+        "- Blocker: keep this on the implementation path.\n"
+        "- Incidental context: a previous pass said no_blockers_found after /approve.\n\n"
+        f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
+    )
+    result = service.handle_event(make_pr_comment_event(pr_number=101, body=review_body))
+    service.wait_for_idle()
+
+    implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)[
+        -1
+    ]
+    assert result["stage"] == "implementation"
+    assert implementation_job.metadata["review_comment_body"] == review_body
+    assert implementation_job.metadata["review_round_outcome"] == "changes_requested"
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101) == []
+
+
+def test_negated_approval_command_with_blocker_routes_to_implementation(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+
+    review_body = (
+        "Do not use the approval command yet; /approve would be wrong.\nA blocker remains in the worker routing."
+    )
+
+    assert service._classify_review_round_outcome(review_body) == "changes_requested"
+
+
 def test_unclear_review_round_does_not_launch_worker(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
     add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)

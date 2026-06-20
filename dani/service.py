@@ -971,10 +971,16 @@ class DaniService:
     def _classify_review_round_outcome(self, body: str) -> str:
         normalized = re.sub(r"[_\-\s]+", " ", body.casefold())
         underscored = re.sub(r"[\-\s]+", "_", body.casefold())
+
+        changes_requested = any(
+            value in normalized or value in underscored
+            for value in REVIEW_ROUND_CHANGES_REQUESTED_VALUES
+            if value not in {"blocker", "blocking"}
+        ) or bool(re.search(r"(?<!no )\bblockers?\b|(?<!no )(?<!not )\bblocking\b", normalized))
+        if changes_requested:
+            return "changes_requested"
         if any(value in normalized or value in underscored for value in REVIEW_ROUND_NO_BLOCKERS_VALUES):
             return "no_blockers_found"
-        if any(value in normalized or value in underscored for value in REVIEW_ROUND_CHANGES_REQUESTED_VALUES):
-            return "changes_requested"
         return "unclear"
 
     def _handle_review_round_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
