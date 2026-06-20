@@ -627,6 +627,83 @@ def test_binaries_gjc_runtime_requires_gjc_only_for_runtime(tmp_path: Path, monk
     assert records["opencode"]["severity"] == "skip"
 
 
+def test_binaries_gjc_runtime_uses_configured_env_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    configured_gjc = tmp_path / "bin" / "gjc"
+    configured_gjc.parent.mkdir()
+    configured_gjc.write_text("#!/bin/sh\nprintf 'gjc test\\n'\n", encoding="utf-8")
+    configured_gjc.chmod(0o755)
+
+    fake_paths = {
+        "git": "/usr/bin/git",
+        "gh": "/usr/bin/gh",
+    }
+    monkeypatch.setattr("shutil.which", lambda name: fake_paths.get(name))
+    monkeypatch.setattr("dani.doctor._probe_binary_version", lambda binary, *, timeout_seconds: "v1")
+    ctx = _make_ctx(
+        tmp_path,
+        env={
+            "DANI_AGENT_RUNTIME": "gjc",
+            "DANI_GJC_BIN": str(configured_gjc),
+        },
+    )
+
+    result = _check_binaries(ctx)
+
+    assert result.status == CheckStatus.OK
+    records = {r["name"]: r for r in result.details["binaries"]}
+    assert records["gjc"]["path"] == str(configured_gjc)
+    assert records["gjc"]["version"] == "v1"
+
+
+def test_binaries_gjc_runtime_uses_configured_file_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    configured_gjc = tmp_path / "bin" / "gjc"
+    configured_gjc.parent.mkdir()
+    configured_gjc.write_text("#!/bin/sh\nprintf 'gjc test\\n'\n", encoding="utf-8")
+    configured_gjc.chmod(0o755)
+
+    fake_paths = {
+        "git": "/usr/bin/git",
+        "gh": "/usr/bin/gh",
+    }
+    monkeypatch.setattr("shutil.which", lambda name: fake_paths.get(name))
+    monkeypatch.setattr("dani.doctor._probe_binary_version", lambda binary, *, timeout_seconds: "v1")
+    ctx = _make_ctx(
+        tmp_path,
+        env={"DANI_AGENT_RUNTIME": "gjc"},
+        config_parsed={"gjc_bin": str(configured_gjc)},
+    )
+
+    result = _check_binaries(ctx)
+
+    assert result.status == CheckStatus.OK
+    records = {r["name"]: r for r in result.details["binaries"]}
+    assert records["gjc"]["path"] == str(configured_gjc)
+
+
+def test_binaries_gjc_runtime_fails_for_missing_configured_binary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    missing_gjc = tmp_path / "bin" / "missing-gjc"
+    fake_paths = {
+        "git": "/usr/bin/git",
+        "gh": "/usr/bin/gh",
+    }
+    monkeypatch.setattr("shutil.which", lambda name: fake_paths.get(name))
+    monkeypatch.setattr("dani.doctor._probe_binary_version", lambda binary, *, timeout_seconds: "v1")
+    ctx = _make_ctx(
+        tmp_path,
+        env={
+            "DANI_AGENT_RUNTIME": "gjc",
+            "DANI_GJC_BIN": str(missing_gjc),
+        },
+    )
+
+    result = _check_binaries(ctx)
+
+    assert result.status == CheckStatus.FAIL
+    records = {r["name"]: r for r in result.details["binaries"]}
+    assert records["gjc"]["found"] is False
+    assert records["gjc"]["configured_command"] == str(missing_gjc)
+
+
 def test_process_sprawl_classifies_gjc_print_process() -> None:
     assert _classify_ps_command("/bin/sh -c exec gjc -p prompt") == "gjc_print"
     assert _classify_ps_command("/bin/sh -c exec gjc --resume gjc-session -p prompt") == "gjc_print"

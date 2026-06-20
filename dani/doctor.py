@@ -956,6 +956,72 @@ def _binary_record(
     }
 
 
+def _configured_binary_record(
+    name: str,
+    command: str,
+    *,
+    required: bool,
+    timeout_seconds: float,
+    severity_when_missing: CheckStatus,
+) -> dict[str, Any]:
+    import shutil
+
+    configured = command.strip()
+    if not configured:
+        return _binary_record(
+            name,
+            required=required,
+            timeout_seconds=timeout_seconds,
+            severity_when_missing=severity_when_missing,
+        )
+
+    if "/" in configured:
+        path = Path(configured).expanduser()
+        found = path.is_file() and os.access(path, os.X_OK)
+        resolved_path = str(path) if found else None
+        version_command = str(path)
+    else:
+        resolved = shutil.which(configured)
+        found = resolved is not None
+        resolved_path = resolved
+        version_command = configured
+
+    if not found:
+        return {
+            "name": name,
+            "path": resolved_path,
+            "version": None,
+            "required": required,
+            "found": False,
+            "severity": severity_when_missing.value,
+            "configured_command": configured,
+        }
+
+    return {
+        "name": name,
+        "path": resolved_path,
+        "version": _probe_binary_version(version_command, timeout_seconds=timeout_seconds),
+        "required": required,
+        "found": True,
+        "severity": CheckStatus.OK.value,
+        "configured_command": configured,
+    }
+
+
+def _resolved_gjc_bin(ctx: CheckContext) -> str | None:
+    value: Any = ctx.env.get("DANI_GJC_BIN")
+    if value is None and ctx.config_parsed:
+        value = ctx.config_parsed.get("gjc_bin")
+    if value is None and ctx.config_parsed:
+        gjc_config = ctx.config_parsed.get("gjc")
+        if isinstance(gjc_config, dict):
+            value = gjc_config.get("bin") or gjc_config.get("binary") or gjc_config.get("path")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 @register_check("binaries")
 def _check_binaries(ctx: CheckContext) -> CheckResult:
     runtime = _resolved_agent_runtime(ctx).lower()
@@ -1032,14 +1098,26 @@ def _check_binaries(ctx: CheckContext) -> CheckResult:
             "skip_reason": f"agent_runtime={runtime}",
         })
     if runtime in GJC_FAMILY:
-        records.append(
-            _binary_record(
-                "gjc",
-                required=True,
-                timeout_seconds=ctx.timeout_seconds,
-                severity_when_missing=CheckStatus.FAIL,
+        gjc_bin = _resolved_gjc_bin(ctx)
+        if gjc_bin:
+            records.append(
+                _configured_binary_record(
+                    "gjc",
+                    gjc_bin,
+                    required=True,
+                    timeout_seconds=ctx.timeout_seconds,
+                    severity_when_missing=CheckStatus.FAIL,
+                )
             )
-        )
+        else:
+            records.append(
+                _binary_record(
+                    "gjc",
+                    required=True,
+                    timeout_seconds=ctx.timeout_seconds,
+                    severity_when_missing=CheckStatus.FAIL,
+                )
+            )
     else:
         records.append({
             "name": "gjc",
