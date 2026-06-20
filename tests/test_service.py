@@ -2471,6 +2471,14 @@ def test_pr_opened_from_implementation_signature_queues_review_round(tmp_path: P
     review_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=99)
     assert result["stage"] == "review_round"
     assert review_jobs[0].review_round == 1
+    assert review_jobs[0].metadata["route_reason"] == "implementation_pr_opened"
+    assert review_jobs[0].metadata["source_event"]["signature_stage"] == "implementation"
+    assert review_jobs[0].metadata["source_event"]["signature_job"] == implementation_job.id
+    assert review_jobs[0].metadata["route_decision"] == {
+        "from": "implementation",
+        "to": "review_round",
+        "because": "implementation PR event queued review round",
+    }
     assert omx_runner.launches[-1]["job"].stage == "review_round"
 
 

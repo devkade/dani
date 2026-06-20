@@ -310,6 +310,48 @@ def test_queue_doctor_json_reports_failures(tmp_path: Path) -> None:
     assert payload["failures"][0]["code"] == "role_binding_mismatch"
 
 
+def test_queue_doctor_json_reports_warning_exit(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / ".dani"
+    _write_queue_state(
+        data_dir,
+        jobs=[
+            {
+                "id": "job-1",
+                "repo_full_name": "acme/demo",
+                "stage": "implementation",
+                "role": "worker",
+                "issue_number": 16,
+                "pr_number": None,
+                "review_round": None,
+                "metadata": {},
+                "status": "queued",
+                "session_id": None,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "updated_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+    )
+
+    result = runner.invoke(app, ["queue", "doctor", "--json", "--data-dir", str(data_dir), "--stuck-age-seconds", "0"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["health"] == "warn"
+    assert payload["warnings"][0]["code"] == "active_job_stuck"
+
+
+def test_inspect_job_command_reports_unknown_job(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / ".dani"
+    _write_queue_state(data_dir, jobs=[])
+
+    result = runner.invoke(app, ["inspect", "job", "missing", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 1
+    assert "Unknown job id: missing" in result.stderr
+
+
 def test_inspect_job_command_prints_route_metadata(tmp_path: Path) -> None:
     runner = CliRunner()
     data_dir = tmp_path / ".dani"

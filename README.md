@@ -135,7 +135,26 @@ dani serve --data-dir .dani
 dani bootstrap owner/name
 dani show-state
 dani doctor
+dani status
+dani queue doctor --json
+dani inspect job <job-id>
 ```
+
+### Queue Observability
+
+`dani status` and `dani queue status` print read-only queue health for operators:
+server/data-dir details, queue counts, stuck active jobs, latest active lanes,
+and recent transitions.
+
+`dani queue doctor` runs queue-specific invariant checks over the existing JSON
+state. Use `--json` for automation and `--stuck-age-seconds N` to tune the active
+job warning threshold. Exit code `0` means healthy, `1` means warnings only, and
+`2` means failures such as storage parse errors, role binding drift, duplicate
+processed events, or active worker jobs targeting terminal PRs.
+
+`dani inspect job <job-id>` prints one persisted job with its role, runtime,
+profile, source event, route reason, route decision, session paths, and work-line
+linkage. Add `--json` for machine-readable output.
 
 ## dani doctor
 

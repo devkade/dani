@@ -692,6 +692,13 @@ class DaniService:
                     **lineage_metadata,
                     "title": (pr_metadata.get("title") or event.title or ""),
                 },
+                route_reason="implementation_review_limit_reached",
+                source_event=self._source_event_metadata(event, signature=signature),
+                route_decision={
+                    "from": "implementation",
+                    "to": "final_verdict",
+                    "because": "review round limit reached after implementation event",
+                },
             )
             return {"status": "queued", "job_id": verdict_job.id, "stage": verdict_job.stage}
 
@@ -706,6 +713,13 @@ class DaniService:
                 **pr_metadata,
                 **lineage_metadata,
                 "title": (pr_metadata.get("title") or event.title or ""),
+            },
+            route_reason="implementation_agent_event",
+            source_event=self._source_event_metadata(event, signature=signature),
+            route_decision={
+                "from": "implementation",
+                "to": "review_round",
+                "because": "implementation agent event queued next review round",
             },
         )
         return {"status": "queued", "job_id": review_job.id, "stage": review_job.stage}
@@ -3204,7 +3218,13 @@ class DaniService:
                     "body": event.body or "",
                     "pr_review_state": "review_round_1_pending",
                 },
-                **self._route_kwargs(event),
+                route_reason="implementation_pr_opened",
+                source_event=self._source_event_metadata(event, signature=signature),
+                route_decision={
+                    "from": "implementation",
+                    "to": "review_round",
+                    "because": "implementation PR event queued review round",
+                },
             )
             return {"status": "queued", "job_id": job.id, "stage": job.stage}
 

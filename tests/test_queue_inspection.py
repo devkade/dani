@@ -93,6 +93,46 @@ def test_queue_status_text_summarizes_health_and_lanes(tmp_path: Path) -> None:
     assert "review_round_changes_requested" in text
 
 
+def test_latest_active_lanes_show_newest_jobs_first(tmp_path: Path) -> None:
+    base_time = datetime(2026, 6, 20, tzinfo=timezone.utc)
+    jobs = [
+        _job(
+            f"job-{index}",
+            "implementation",
+            "worker",
+            created_at=(base_time + timedelta(minutes=index)).isoformat(),
+        )
+        for index in range(12)
+    ]
+    _write_state(tmp_path, jobs=jobs)
+
+    report = build_queue_report(tmp_path)
+
+    assert [item["id"] for item in report["latest_active_lanes"]] == [
+        "job-11",
+        "job-10",
+        "job-9",
+        "job-8",
+        "job-7",
+        "job-6",
+        "job-5",
+        "job-4",
+        "job-3",
+        "job-2",
+    ]
+
+
+def test_storage_errors_make_queue_health_fail(tmp_path: Path) -> None:
+    _write_state(tmp_path, jobs=[])
+    (tmp_path / "jobs.json").write_text("{broken", encoding="utf-8")
+
+    report = build_queue_report(tmp_path)
+
+    assert report["health"] == "fail"
+    assert report["storage_errors"]["jobs"]
+    assert any(item["code"] == "storage_error" and item["file"] == "jobs" for item in report["failures"])
+
+
 def test_queue_doctor_json_flags_role_routing_and_pr_anomalies(tmp_path: Path) -> None:
     old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
     jobs = [

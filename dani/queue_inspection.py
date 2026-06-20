@@ -24,10 +24,10 @@ def build_queue_report(data_dir: Path, *, stuck_age_seconds: int = DEFAULT_STUCK
     repos = _items(state, "registry", "repos")
     active_jobs = [job for job in jobs if job.get("status") in ACTIVE_JOB_STATUSES]
     failures, warnings = _find_findings(state, now=now, stuck_age_seconds=stuck_age_seconds)
-    recent_jobs = sorted(
-        jobs, key=lambda item: str(item.get("created_at") or item.get("updated_at") or ""), reverse=True
-    )
-    latest_lanes = [_lane_summary(job, sessions=sessions, now=now) for job in active_jobs[:10]]
+    failures = _storage_error_findings(state) + failures
+    recent_jobs = sorted(jobs, key=_job_sort_time, reverse=True)
+    latest_active_jobs = sorted(active_jobs, key=_job_sort_time, reverse=True)
+    latest_lanes = [_lane_summary(job, sessions=sessions, now=now) for job in latest_active_jobs[:10]]
     recent_transitions = [_transition_summary(job) for job in recent_jobs[:10]]
 
     return {
@@ -264,6 +264,13 @@ def _active_worker_targets_closed_or_merged_pr(job: dict[str, Any], *, stage: st
     )
 
 
+def _storage_error_findings(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"code": "storage_error", "message": f"{name}.json could not be read", "file": name, "error": error}
+        for name, error in _dict(state.get("errors")).items()
+    ]
+
+
 def _duplicate_processed_event_findings(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
@@ -356,6 +363,10 @@ def _failed_last_24h(jobs: list[dict[str, Any]], now: datetime) -> int:
         if timestamp is not None and timestamp >= cutoff:
             count += 1
     return count
+
+
+def _job_sort_time(job: dict[str, Any]) -> str:
+    return str(job.get("updated_at") or job.get("created_at") or "")
 
 
 def _parse_time(value: Any) -> datetime | None:
