@@ -79,6 +79,19 @@ RETRY_BACKOFF_SECONDS: list[int] = [60, 180, 600]
 
 logger = logging.getLogger(__name__)
 FINAL_VERDICT_MERGE_STAGE = "final_verdict_merge"
+REVIEW_STATUS_NEEDS_CHANGE = "NEEDS_CHANGE"
+REVIEW_STATUS_READY_FOR_FINAL_VERDICT = "READY_FOR_FINAL_VERDICT"
+REVIEW_STATUS_BLOCKED = "BLOCKED"
+REVIEW_STATUS_INCONCLUSIVE = "INCONCLUSIVE"
+ALLOWED_REVIEW_STATUSES = frozenset(
+    {
+        REVIEW_STATUS_NEEDS_CHANGE,
+        REVIEW_STATUS_READY_FOR_FINAL_VERDICT,
+        REVIEW_STATUS_BLOCKED,
+        REVIEW_STATUS_INCONCLUSIVE,
+    }
+)
+ALLOWED_FINAL_VERDICTS = frozenset({"APPROVE", "REJECT"})
 
 
 class DaniService:
@@ -638,6 +651,47 @@ class DaniService:
             return {"status": "ignored", "reason": "pr_terminal"}
         return self._queue_pull_request_review(repo, event, signature)
 
+    def _first_non_empty_line(self, text: str | None) -> str:
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if stripped:
+                return stripped
+        return ""
+
+    def _parse_prefixed_comment_value(self, text: str | None, prefix: str, allowed: frozenset[str]) -> str | None:
+        line = self._first_non_empty_line(text)
+        expected_prefix = f"{prefix}:"
+        if not line.upper().startswith(expected_prefix):
+            return None
+        value = line[len(expected_prefix) :].strip().upper().replace("-", "_").replace(" ", "_")
+        return value if value in allowed else None
+
+    def _review_status_from_event(self, event: NormalizedEvent, signature: dict[str, str]) -> str | None:
+        status = self._parse_prefixed_comment_value(event.body, "STATUS", ALLOWED_REVIEW_STATUSES)
+        signature_status = str(signature.get("status") or "").strip().upper().replace("-", "_").replace(" ", "_")
+        if signature_status and signature_status in ALLOWED_REVIEW_STATUSES:
+            if status is not None and status != signature_status:
+                return None
+            return signature_status
+        return status or REVIEW_STATUS_NEEDS_CHANGE
+
+    def _final_verdict_from_event(self, event: NormalizedEvent, signature: dict[str, str]) -> str | None:
+        verdict = self._parse_prefixed_comment_value(event.body, "VERDICT", ALLOWED_FINAL_VERDICTS)
+        signature_verdict = str(signature.get("verdict") or "").strip().upper()
+        if signature_verdict and signature_verdict in ALLOWED_FINAL_VERDICTS:
+            if verdict is not None and verdict != signature_verdict:
+                return None
+            return signature_verdict
+        return verdict
+
+    def _handle_final_verdict_comment_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
+        verdict = self._final_verdict_from_event(event, signature)
+        if verdict is None:
+            return {"status": "ignored", "reason": "missing_or_mismatched_verdict"}
+        if verdict == "APPROVE":
+            return self._handle_final_verdict_agent_event(event, signature)
+        return {"status": "updated", "stage": "final_verdict", "verdict": verdict}
+
     def _handle_agent_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         stage = signature.get("stage")
         if stage == "review_round":
@@ -656,8 +710,8 @@ class DaniService:
         if stage == "merge_conflict_resolution":
             return self._handle_merge_conflict_resolution_agent_event(event, signature)
 
-        if stage == "final_verdict" and signature.get("verdict") == "APPROVE":
-            return self._handle_final_verdict_agent_event(event, signature)
+        if stage == "final_verdict":
+            return self._handle_final_verdict_comment_event(event, signature)
 
         if stage == RETARGET_REQUEST_STAGE:
             return {"status": "ignored", "reason": "retarget_request_no_action"}
@@ -956,6 +1010,9 @@ class DaniService:
 
     def _handle_review_round_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         event_key = self._agent_event_key(signature, default_pr=event.number if event.is_pull_request else None)
+        review_status = self._review_status_from_event(event, signature)
+        if review_status is None:
+            return {"status": "ignored", "reason": "missing_or_mismatched_review_status"}
         if not self.storage.record_processed_event(event_key):
             return {"status": "ignored", "reason": "duplicate_agent_event"}
         review_round = int(signature["round"])
@@ -971,10 +1028,25 @@ class DaniService:
             return {"status": "ignored", "reason": "pr_not_open"}
         pr_metadata = self._pull_request_metadata(event.repo_full_name, pr_number)
         lineage_metadata = self._automation_lineage_metadata(source_job)
-        if issue_number is None:
-            return {"status": "ignored", "reason": "untracked_pr"}
-        if not self._is_pr_open(event.repo_full_name, pr_number):
-            return {"status": "ignored", "reason": "pr_not_open"}
+        if review_status == REVIEW_STATUS_READY_FOR_FINAL_VERDICT:
+            verdict_job = self._enqueue_job(
+                repo,
+                stage="final_verdict",
+                issue_number=issue_number,
+                pr_number=pr_number,
+                metadata={
+                    **pr_metadata,
+                    **lineage_metadata,
+                    "title": (pr_metadata.get("title") or event.title or ""),
+                    "review_comment_body": event.body or "",
+                    "triggering_review_round": review_round,
+                    "triggering_review_status": review_status,
+                },
+            )
+            return {"status": "queued", "job_id": verdict_job.id, "stage": verdict_job.stage, "review_status": review_status}
+        if review_status in {REVIEW_STATUS_BLOCKED, REVIEW_STATUS_INCONCLUSIVE}:
+            self._update_work_line_state(source_job, review_state=review_status.lower(), retryable=False)
+            return {"status": "blocked", "stage": "review_round", "review_status": review_status}
         next_job = self._enqueue_job(
             repo,
             stage="implementation",
@@ -987,9 +1059,10 @@ class DaniService:
                 "title": (pr_metadata.get("title") or event.title or ""),
                 "review_comment_body": event.body or "",
                 "triggering_review_round": review_round,
+                "triggering_review_status": review_status,
             },
         )
-        return {"status": "queued", "job_id": next_job.id, "stage": next_job.stage}
+        return {"status": "queued", "job_id": next_job.id, "stage": next_job.stage, "review_status": review_status}
 
     def _enqueue_job(
         self,

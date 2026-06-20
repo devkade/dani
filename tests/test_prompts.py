@@ -523,6 +523,16 @@ def test_review_round_prompt_for_external_contribution_mentions_contributor_owne
     assert "/approve" in prompt
 
 
+def test_review_round_prompt_requires_top_status_line() -> None:
+    prompt = render_prompt("review_round", _review_round_context())
+
+    assert "The first non-empty line of your PR comment MUST be exactly one of:" in prompt
+    assert "STATUS: NEEDS_CHANGE" in prompt
+    assert "STATUS: READY_FOR_FINAL_VERDICT" in prompt
+    assert "STATUS: BLOCKED" in prompt
+    assert "STATUS: INCONCLUSIVE" in prompt
+
+
 def test_final_verdict_prompt_contains_both_signatures() -> None:
     prompt = render_prompt(
         "final_verdict",
@@ -539,6 +549,8 @@ def test_final_verdict_prompt_contains_both_signatures() -> None:
 
     assert "verdict=APPROVE" in prompt
     assert "verdict=REJECT" in prompt
+    assert "VERDICT: APPROVE" in prompt
+    assert "VERDICT: REJECT" in prompt
 
 
 def test_final_verdict_prompt_requires_general_real_result_evidence() -> None:

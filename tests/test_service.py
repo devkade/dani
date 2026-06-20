@@ -24,7 +24,7 @@ from dani.omx_runner import OmxRunner
 from dani.prompts import NON_INTERACTIVE_GUARD
 from dani.service import DaniService
 from dani.session_bridge import BridgeContext, OmoSessionBridge
-from dani.signatures import build_signature
+from dani.signatures import build_signature, parse_signature
 from dani.storage import JsonStorage
 from dani.work_line import GitWorkLineManager
 from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner, FakeRuntimeRunner, FakeWorkLineManager
@@ -245,6 +245,13 @@ def make_pr_event(
 
 
 def make_pr_comment_event(*, pr_number: int, body: str, actor_login: str = "agent") -> NormalizedEvent:
+    parsed = parse_signature(body)
+    if parsed is not None:
+        if parsed.get("stage") == "review_round" and not body.lstrip().startswith("STATUS:"):
+            body = f"STATUS: NEEDS_CHANGE\n\n{body}"
+        elif parsed.get("stage") == "final_verdict" and not body.lstrip().startswith("VERDICT:"):
+            verdict = str(parsed.get("verdict") or "APPROVE").upper()
+            body = f"VERDICT: {verdict}\n\n{body}"
     return NormalizedEvent(
         kind="pull_request_comment",
         repo_full_name="acme/demo",
@@ -256,6 +263,77 @@ def make_pr_comment_event(*, pr_number: int, body: str, actor_login: str = "agen
         title=f"Feature/#{pr_number}",
         is_pull_request=True,
     )
+
+
+def test_review_round_ready_status_queues_final_verdict(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+    service.storage.create_job(
+        JobRecord(repo_full_name="acme/demo", stage="review_round", issue_number=5, pr_number=77, review_round=1)
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "STATUS: READY_FOR_FINAL_VERDICT\n\n"
+                f"{build_signature(stage='review_round', job='review-1', pr=77, round=1, issue=5)}"
+            ),
+        )
+    )
+
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict"
+    assert result["review_status"] == "READY_FOR_FINAL_VERDICT"
+    assert len(service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77)) == 1
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=77) == []
+
+
+def test_review_round_blocked_status_does_not_queue_implementation(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+    source_job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="review_round",
+            issue_number=5,
+            pr_number=77,
+            review_round=1,
+            metadata={"line_id": "issue-5"},
+        )
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "STATUS: BLOCKED\n\n"
+                f"{build_signature(stage='review_round', job=source_job.id, pr=77, round=1, issue=5)}"
+            ),
+        )
+    )
+
+    assert result == {"status": "blocked", "stage": "review_round", "review_status": "BLOCKED"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=77) == []
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77) == []
+
+
+def test_final_verdict_line_must_match_signature_verdict(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "VERDICT: REJECT\n\n"
+                f"{build_signature(stage='final_verdict', job='verdict-1', pr=77, verdict='APPROVE')}"
+            ),
+        )
+    )
+
+    assert result == {"status": "ignored", "reason": "missing_or_mismatched_verdict"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict_merge", pr_number=77) == []
 
 
 def test_issue_readiness_review_persists_omx_session_id(tmp_path: Path) -> None:

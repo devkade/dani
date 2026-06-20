@@ -226,7 +226,20 @@ $review_mode_note
 $runtime_stage_instructions
 Use the code locally and run $$code-review before writing the review comment.
 Do real verification, not only static inspection.
+The first non-empty line of your PR comment MUST be exactly one of:
+STATUS: NEEDS_CHANGE
+STATUS: READY_FOR_FINAL_VERDICT
+STATUS: BLOCKED
+STATUS: INCONCLUSIVE
+
+Status meanings:
+- NEEDS_CHANGE: the contributor/implementation agent must make changes before another review.
+- READY_FOR_FINAL_VERDICT: the PR is clean enough to move to the final merge verdict gate.
+- BLOCKED: a human decision, credential, or external dependency is required before automation can continue.
+- INCONCLUSIVE: verification evidence is insufficient or unreliable; do not route implementation or merge yet.
+
 Checklist:
+- [ ] First non-empty line is exactly one STATUS line from the allowed list above
 - [ ] Use $$code-review
 - [ ] Run the code or tests needed to validate behavior
 - [ ] Include Real Result from actual verification
@@ -284,7 +297,12 @@ $discussion
 
 $runtime_stage_instructions
 Leave exactly one GitHub PR comment for this review pass.
+The first non-empty line of your PR comment MUST be exactly one of:
+VERDICT: APPROVE
+VERDICT: REJECT
+
 Checklist:
+- [ ] First non-empty line is exactly one VERDICT line from the allowed list above
 - [ ] Verdict: APPROVE or REJECT
 - [ ] Short reason
 - [ ] Real Result from actual verification
