@@ -129,6 +129,21 @@ def _resolve_repo_concurrency(config_payload: dict[str, object]) -> int:
     return _parse_positive_int(value, name="repo_concurrency")
 
 
+def _resolve_gjc_bin(config_payload: dict[str, object]) -> str | None:
+    value = os.environ.get("DANI_GJC_BIN")
+    if value is None:
+        value = config_payload.get("gjc_bin")
+    if value is None:
+        gjc_config = config_payload.get("gjc")
+        if isinstance(gjc_config, dict):
+            typed_gjc_config = cast(dict[str, object], gjc_config)
+            value = typed_gjc_config.get("bin") or typed_gjc_config.get("binary") or typed_gjc_config.get("path")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _resolve_issue_ready_launch(config_payload: dict[str, object]) -> str:
     value = os.environ.get("DANI_ISSUE_READY_LAUNCH") or config_payload.get(
         "issue_ready_launch", ISSUE_READY_LAUNCH_MANUAL
@@ -159,6 +174,7 @@ def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> D
     max_issue_followups = _resolve_max_issue_followups(config_payload)
     repo_concurrency = _resolve_repo_concurrency(config_payload)
     issue_ready_launch = _resolve_issue_ready_launch(config_payload)
+    gjc_bin = _resolve_gjc_bin(config_payload)
     role_bindings = config_payload.get("role_bindings", {})
     if not isinstance(role_bindings, dict):
         role_bindings = {}
@@ -175,6 +191,7 @@ def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> D
         repo_concurrency=repo_concurrency,
         role_bindings=typed_role_bindings,
         issue_ready_launch=issue_ready_launch,
+        gjc_bin=gjc_bin,
     )
 
 
