@@ -24,7 +24,9 @@ def build_queue_report(data_dir: Path, *, stuck_age_seconds: int = DEFAULT_STUCK
     repos = _items(state, "registry", "repos")
     active_jobs = [job for job in jobs if job.get("status") in ACTIVE_JOB_STATUSES]
     failures, warnings = _find_findings(state, now=now, stuck_age_seconds=stuck_age_seconds)
-    recent_jobs = sorted(jobs, key=lambda item: str(item.get("created_at") or item.get("updated_at") or ""), reverse=True)
+    recent_jobs = sorted(
+        jobs, key=lambda item: str(item.get("created_at") or item.get("updated_at") or ""), reverse=True
+    )
     latest_lanes = [_lane_summary(job, sessions=sessions, now=now) for job in active_jobs[:10]]
     recent_transitions = [_transition_summary(job) for job in recent_jobs[:10]]
 
@@ -61,7 +63,8 @@ def inspect_job(data_dir: Path, job_id: str) -> dict[str, Any]:
     jobs = _items(state, "jobs", "jobs")
     job = next((item for item in jobs if item.get("id") == job_id), None)
     if job is None:
-        raise KeyError(f"Unknown job id: {job_id}")
+        msg = f"Unknown job id: {job_id}"
+        raise KeyError(msg)
     metadata = _dict(job.get("metadata"))
     sessions = [item for item in _items(state, "sessions", "sessions") if item.get("job_id") == job_id]
     session = sessions[-1] if sessions else None
@@ -76,14 +79,12 @@ def inspect_job(data_dir: Path, job_id: str) -> dict[str, Any]:
         "work_line": work_line,
         "metadata": metadata,
     }
-    detail["job"].update(
-        {
-            "session_id": job.get("session_id"),
-            "route_reason": metadata.get("route_reason"),
-            "runtime": _job_runtime(job, session),
-            "profile": _job_profile(job, session),
-        }
-    )
+    detail["job"].update({
+        "session_id": job.get("session_id"),
+        "route_reason": metadata.get("route_reason"),
+        "runtime": _job_runtime(job, session),
+        "profile": _job_profile(job, session),
+    })
     return detail
 
 
@@ -110,18 +111,16 @@ def render_status_text(report: dict[str, Any]) -> str:
     lanes = list(report.get("latest_active_lanes") or [])
     if lanes:
         for lane in lanes:
-            lines.extend(
-                [
-                    f"- repo: {lane.get('repo')}",
-                    f"  issue: {_number(lane.get('issue'))}",
-                    f"  pr: {_number(lane.get('pr'))}",
-                    f"  stage: {lane.get('stage')}",
-                    f"  role: {lane.get('role')}",
-                    f"  runtime: {lane.get('runtime') or '-'}",
-                    f"  profile: {lane.get('profile') or '-'}",
-                    f"  age: {lane.get('age')}",
-                ]
-            )
+            lines.extend([
+                f"- repo: {lane.get('repo')}",
+                f"  issue: {_number(lane.get('issue'))}",
+                f"  pr: {_number(lane.get('pr'))}",
+                f"  stage: {lane.get('stage')}",
+                f"  role: {lane.get('role')}",
+                f"  runtime: {lane.get('runtime') or '-'}",
+                f"  profile: {lane.get('profile') or '-'}",
+                f"  age: {lane.get('age')}",
+            ])
     else:
         lines.append("- none")
     lines.extend(["", "Recent transitions:"])
@@ -130,7 +129,7 @@ def render_status_text(report: dict[str, Any]) -> str:
         for transition in transitions:
             lines.append(
                 f"- {transition.get('source', 'event')} -> {transition.get('stage')} {transition.get('status')}"
-                f" / {transition.get('reason', '-') }"
+                f" / {transition.get('reason', '-')}"
             )
     else:
         lines.append("- none")
@@ -157,61 +156,129 @@ def render_inspect_text(detail: dict[str, Any]) -> str:
         f"- route_decision: {json.dumps(detail.get('route_decision'), ensure_ascii=False, sort_keys=True)}",
     ]
     if session:
-        lines.extend(
-            [
-                "Session:",
-                f"- id: {session.get('id')}",
-                f"- prompt_path: {session.get('prompt_path')}",
-                f"- script_path: {session.get('script_path')}",
-                f"- worktree_path: {session.get('worktree_path')}",
-                f"- stdout_path: {session.get('stdout_path')}",
-                f"- stderr_path: {session.get('stderr_path')}",
-            ]
-        )
+        lines.extend([
+            "Session:",
+            f"- id: {session.get('id')}",
+            f"- prompt_path: {session.get('prompt_path')}",
+            f"- script_path: {session.get('script_path')}",
+            f"- worktree_path: {session.get('worktree_path')}",
+            f"- stdout_path: {session.get('stdout_path')}",
+            f"- stderr_path: {session.get('stderr_path')}",
+        ])
     if work_line:
         lines.extend(["Work line:", f"- line_id: {work_line.get('line_id')}", f"- status: {work_line.get('status')}"])
     return "\n".join(lines)
 
 
-def _find_findings(state: dict[str, Any], *, now: datetime, stuck_age_seconds: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _find_findings(
+    state: dict[str, Any], *, now: datetime, stuck_age_seconds: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     failures: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     jobs = _items(state, "jobs", "jobs")
-    terminal_prs = {
+    terminal_prs = _terminal_pr_targets(state)
+
+    for job in jobs:
+        failures.extend(_job_failures(job, terminal_prs=terminal_prs))
+        warnings.extend(_job_warnings(job, now=now, stuck_age_seconds=stuck_age_seconds))
+
+    failures.extend(_duplicate_processed_event_findings(state))
+    warnings.extend(_duplicate_source_findings(jobs))
+    warnings.extend(_work_line_mismatches(state))
+    return failures, warnings
+
+
+def _terminal_pr_targets(state: dict[str, Any]) -> set[tuple[Any, Any]]:
+    return {
         (entry.get("repo"), entry.get("pr"))
         for entry in _items(state, "terminal_targets", "prs")
         if entry.get("repo") and entry.get("pr") is not None
     }
-    for job in jobs:
-        job_id = job.get("id")
-        stage = str(job.get("stage") or "")
-        role = job.get("role") or _dict(job.get("metadata")).get("role")
-        expected_role = EXPECTED_ROLE_BY_STAGE.get(stage)
-        if expected_role and role != expected_role:
-            failures.append(_finding("role_binding_mismatch", job, f"{stage} expected {expected_role}, got {role}"))
-        if _is_review_no_blockers_to_implementation(job):
-            failures.append(
-                _finding("review_no_blockers_routed_to_implementation", job, "review_round no_blockers_found routed to implementation")
+
+
+def _job_failures(job: dict[str, Any], *, terminal_prs: set[tuple[Any, Any]]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    stage = str(job.get("stage") or "")
+    role = _job_role(job)
+
+    expected_role = EXPECTED_ROLE_BY_STAGE.get(stage)
+    if expected_role and role != expected_role:
+        failures.append(_finding("role_binding_mismatch", job, f"{stage} expected {expected_role}, got {role}"))
+
+    if _is_review_no_blockers_to_implementation(job):
+        failures.append(
+            _finding(
+                "review_no_blockers_routed_to_implementation",
+                job,
+                "review_round no_blockers_found routed to implementation",
             )
-        if job.get("status") in ACTIVE_JOB_STATUSES:
-            age_s = _age_seconds(job, now)
-            if age_s is not None and age_s > stuck_age_seconds:
-                warnings.append(_finding("active_job_stuck", job, f"active job age {int(age_s)}s exceeds {stuck_age_seconds}s"))
-            if stage == "implementation" and role == "worker" and (job.get("repo_full_name"), job.get("pr_number")) in terminal_prs:
-                failures.append(_finding("active_worker_targets_terminal_pr", job, "worker job targets terminal PR"))
-        if _dict(job.get("metadata")).get("pr_state") == "closed" or _dict(job.get("metadata")).get("pr_merged") is True:
-            if job.get("status") in ACTIVE_JOB_STATUSES and stage == "implementation" and role == "worker":
-                failures.append(_finding("active_worker_targets_terminal_pr", job, "worker job targets closed or merged PR"))
-        if not job_id:
-            warnings.append(_finding("job_missing_id", job, "job has no id"))
-    for key, count in Counter(_items(state, "processed_events", "keys")).items():
-        if key and count > 1:
-            failures.append({"code": "duplicate_processed_event", "message": f"processed event {key} appears {count} times", "event_key": key})
-    for source, count in _duplicate_sources(jobs).items():
-        if count > 1:
-            warnings.append({"code": "duplicate_source_side_effect", "message": f"source event {source} produced {count} jobs"})
-    warnings.extend(_work_line_mismatches(state))
-    return failures, warnings
+        )
+
+    if _active_worker_targets_terminal_pr(job, stage=stage, role=role, terminal_prs=terminal_prs):
+        failures.append(_finding("active_worker_targets_terminal_pr", job, "worker job targets terminal PR"))
+
+    if _active_worker_targets_closed_or_merged_pr(job, stage=stage, role=role):
+        failures.append(_finding("active_worker_targets_terminal_pr", job, "worker job targets closed or merged PR"))
+
+    return failures
+
+
+def _job_warnings(job: dict[str, Any], *, now: datetime, stuck_age_seconds: int) -> list[dict[str, Any]]:
+    warnings: list[dict[str, Any]] = []
+    if job.get("status") in ACTIVE_JOB_STATUSES:
+        age_s = _age_seconds(job, now)
+        if age_s is not None and age_s > stuck_age_seconds:
+            warnings.append(
+                _finding("active_job_stuck", job, f"active job age {int(age_s)}s exceeds {stuck_age_seconds}s")
+            )
+    if not job.get("id"):
+        warnings.append(_finding("job_missing_id", job, "job has no id"))
+    return warnings
+
+
+def _active_worker_targets_terminal_pr(
+    job: dict[str, Any],
+    *,
+    stage: str,
+    role: Any,
+    terminal_prs: set[tuple[Any, Any]],
+) -> bool:
+    return (
+        job.get("status") in ACTIVE_JOB_STATUSES
+        and stage == "implementation"
+        and role == "worker"
+        and (job.get("repo_full_name"), job.get("pr_number")) in terminal_prs
+    )
+
+
+def _active_worker_targets_closed_or_merged_pr(job: dict[str, Any], *, stage: str, role: Any) -> bool:
+    metadata = _dict(job.get("metadata"))
+    return (
+        job.get("status") in ACTIVE_JOB_STATUSES
+        and stage == "implementation"
+        and role == "worker"
+        and (metadata.get("pr_state") == "closed" or metadata.get("pr_merged") is True)
+    )
+
+
+def _duplicate_processed_event_findings(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "code": "duplicate_processed_event",
+            "message": f"processed event {key} appears {count} times",
+            "event_key": key,
+        }
+        for key, count in Counter(_items(state, "processed_events", "keys")).items()
+        if key and count > 1
+    ]
+
+
+def _duplicate_source_findings(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"code": "duplicate_source_side_effect", "message": f"source event {source} produced {count} jobs"}
+        for source, count in _duplicate_sources(jobs).items()
+        if count > 1
+    ]
 
 
 def _load_state(data_dir: Path) -> dict[str, Any]:
@@ -268,6 +335,10 @@ def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _job_role(job: dict[str, Any]) -> Any:
+    return job.get("role") or _dict(job.get("metadata")).get("role")
+
+
 def _count_status(jobs: list[dict[str, Any]], statuses: set[str]) -> int:
     return sum(1 for job in jobs if job.get("status") in statuses)
 
@@ -317,7 +388,12 @@ def _job_runtime(job: dict[str, Any], session: dict[str, Any] | None = None) -> 
     metadata = _dict(job.get("metadata"))
     binding = _dict(metadata.get("role_binding"))
     if session:
-        return session.get("effective_runtime") or session.get("native_session_runtime") or session.get("preferred_runtime") or binding.get("runtime")
+        return (
+            session.get("effective_runtime")
+            or session.get("native_session_runtime")
+            or session.get("preferred_runtime")
+            or binding.get("runtime")
+        )
     return binding.get("runtime") or metadata.get("effective_runtime") or metadata.get("preferred_runtime")
 
 
@@ -334,7 +410,7 @@ def _job_summary(job: dict[str, Any], *, now: datetime) -> dict[str, Any]:
         "id": job.get("id"),
         "repo": job.get("repo_full_name"),
         "stage": job.get("stage"),
-        "role": job.get("role") or _dict(job.get("metadata")).get("role"),
+        "role": _job_role(job),
         "runtime": _job_runtime(job),
         "profile": _job_profile(job),
         "status": job.get("status"),
@@ -396,7 +472,14 @@ def _matching_work_line(state: dict[str, Any], job: dict[str, Any]) -> dict[str,
     candidates = _items(state, "work_lines", "work_lines")
     line_id = metadata.get("line_id")
     if line_id:
-        match = next((item for item in candidates if item.get("repo_full_name") == job.get("repo_full_name") and item.get("line_id") == line_id), None)
+        match = next(
+            (
+                item
+                for item in candidates
+                if item.get("repo_full_name") == job.get("repo_full_name") and item.get("line_id") == line_id
+            ),
+            None,
+        )
         if match:
             return match
     issue = str(job.get("issue_number") or "")
@@ -419,7 +502,7 @@ def _finding(code: str, job: dict[str, Any], message: str) -> dict[str, Any]:
         "job_id": job.get("id"),
         "repo": job.get("repo_full_name"),
         "stage": job.get("stage"),
-        "role": job.get("role") or _dict(job.get("metadata")).get("role"),
+        "role": _job_role(job),
         "status": job.get("status"),
         "issue": job.get("issue_number"),
         "pr": job.get("pr_number"),
@@ -456,22 +539,27 @@ def _work_line_mismatches(state: dict[str, Any]) -> list[dict[str, Any]]:
     for line in _items(state, "work_lines", "work_lines"):
         repo = line.get("repo_full_name")
         line_id = line.get("line_id")
-        related = [job for job in jobs if job.get("repo_full_name") == repo and _dict(job.get("metadata")).get("line_id") == line_id]
+        related = [
+            job
+            for job in jobs
+            if job.get("repo_full_name") == repo and _dict(job.get("metadata")).get("line_id") == line_id
+        ]
         if not related:
             continue
         latest = sorted(related, key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""))[-1]
         line_status = str(line.get("status") or "")
         job_status = str(latest.get("status") or "")
-        if line_status in {"running", "review_running", "implementation_running"} and job_status in TERMINAL_JOB_STATUSES:
-            warnings.append(
-                {
-                    "code": "work_line_job_status_mismatch",
-                    "message": f"work line {line_id} is {line_status} but latest job {latest.get('id')} is {job_status}",
-                    "job_id": latest.get("id"),
-                    "repo": repo,
-                    "line_id": line_id,
-                }
-            )
+        if (
+            line_status in {"running", "review_running", "implementation_running"}
+            and job_status in TERMINAL_JOB_STATUSES
+        ):
+            warnings.append({
+                "code": "work_line_job_status_mismatch",
+                "message": f"work line {line_id} is {line_status} but latest job {latest.get('id')} is {job_status}",
+                "job_id": latest.get("id"),
+                "repo": repo,
+                "line_id": line_id,
+            })
     return warnings
 
 

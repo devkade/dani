@@ -10,10 +10,22 @@ from dani.cli import app
 from dani.queue_inspection import build_queue_report, inspect_job, render_status_text
 
 
-def _write_state(data_dir: Path, *, jobs: list[dict], sessions: list[dict] | None = None, work_lines: list[dict] | None = None) -> None:
+def _write_state(
+    data_dir: Path, *, jobs: list[dict], sessions: list[dict] | None = None, work_lines: list[dict] | None = None
+) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "registry.json").write_text(
-        json.dumps({"repos": [{"full_name": "acme/demo", "local_path": "/repo", "main_branch": "main", "dev_branch": "dev", "enabled": True}]}),
+        json.dumps({
+            "repos": [
+                {
+                    "full_name": "acme/demo",
+                    "local_path": "/repo",
+                    "main_branch": "main",
+                    "dev_branch": "dev",
+                    "enabled": True,
+                }
+            ]
+        }),
         encoding="utf-8",
     )
     (data_dir / "jobs.json").write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
@@ -25,7 +37,9 @@ def _write_state(data_dir: Path, *, jobs: list[dict], sessions: list[dict] | Non
         encoding="utf-8",
     )
     (data_dir / "config.json").write_text(
-        json.dumps({"role_bindings": {"worker": {"runtime": "gjc"}, "reviewer": {"runtime": "hermes", "profile": "warden"}}}),
+        json.dumps({
+            "role_bindings": {"worker": {"runtime": "gjc"}, "reviewer": {"runtime": "hermes", "profile": "warden"}}
+        }),
         encoding="utf-8",
     )
     (data_dir / "events.jsonl").write_text(json.dumps({"kind": "issue_comment", "number": 3}) + "\n", encoding="utf-8")
@@ -89,8 +103,16 @@ def test_queue_doctor_json_flags_role_routing_and_pr_anomalies(tmp_path: Path) -
             "worker",
             pr_number=6,
             metadata={
-                "source_event": {"kind": "issue_comment", "signature_stage": "review_round", "review_verdict": "no_blockers_found"},
-                "route_decision": {"from": "review_round", "to": "implementation", "because": "review found no blockers"},
+                "source_event": {
+                    "kind": "issue_comment",
+                    "signature_stage": "review_round",
+                    "review_verdict": "no_blockers_found",
+                },
+                "route_decision": {
+                    "from": "review_round",
+                    "to": "implementation",
+                    "because": "review found no blockers",
+                },
             },
         ),
         _job("closed-pr", "implementation", "worker", pr_number=7),
@@ -98,7 +120,9 @@ def test_queue_doctor_json_flags_role_routing_and_pr_anomalies(tmp_path: Path) -
     ]
     _write_state(tmp_path, jobs=jobs)
 
-    result = CliRunner().invoke(app, ["queue", "doctor", "--json", "--data-dir", str(tmp_path), "--stuck-age-seconds", "3600"])
+    result = CliRunner().invoke(
+        app, ["queue", "doctor", "--json", "--data-dir", str(tmp_path), "--stuck-age-seconds", "3600"]
+    )
 
     assert result.exit_code == 2
     payload = json.loads(result.stdout)
@@ -108,6 +132,21 @@ def test_queue_doctor_json_flags_role_routing_and_pr_anomalies(tmp_path: Path) -
     assert "active_worker_targets_terminal_pr" in codes
     assert "active_job_stuck" in codes
     assert "duplicate_processed_event" in codes
+
+
+def test_queue_doctor_json_flags_closed_and_merged_worker_jobs(tmp_path: Path) -> None:
+    jobs = [
+        _job("closed-metadata", "implementation", "worker", metadata={"pr_state": "closed"}),
+        _job("merged-metadata", "implementation", "worker", metadata={"pr_merged": True}),
+    ]
+    _write_state(tmp_path, jobs=jobs)
+
+    result = CliRunner().invoke(app, ["queue", "doctor", "--json", "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    findings = [item for item in payload["failures"] if item["code"] == "active_worker_targets_terminal_pr"]
+    assert {item["job_id"] for item in findings} == {"closed-metadata", "merged-metadata"}
 
 
 def test_inspect_job_renders_route_session_and_work_line(tmp_path: Path) -> None:
@@ -121,8 +160,16 @@ def test_inspect_job_renders_route_session_and_work_line(tmp_path: Path) -> None
             metadata={
                 "line_id": "issue-3",
                 "route_reason": "review_round_changes_requested",
-                "source_event": {"kind": "issue_comment", "signature_stage": "review_round", "signature_job": "review-job"},
-                "route_decision": {"from": "review_round", "to": "implementation", "because": "review requested changes"},
+                "source_event": {
+                    "kind": "issue_comment",
+                    "signature_stage": "review_round",
+                    "signature_job": "review-job",
+                },
+                "route_decision": {
+                    "from": "review_round",
+                    "to": "implementation",
+                    "because": "review requested changes",
+                },
                 "role_binding": {"runtime": "gjc", "profile": None},
             },
         )
@@ -158,7 +205,15 @@ def test_inspect_job_renders_route_session_and_work_line(tmp_path: Path) -> None
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
     ]
-    work_lines = [{"repo_full_name": "acme/demo", "line_id": "issue-3", "status": "review_changes_requested", "issue_id": "3", "pr_id": "4"}]
+    work_lines = [
+        {
+            "repo_full_name": "acme/demo",
+            "line_id": "issue-3",
+            "status": "review_changes_requested",
+            "issue_id": "3",
+            "pr_id": "4",
+        }
+    ]
     _write_state(tmp_path, jobs=jobs, sessions=sessions, work_lines=work_lines)
 
     detail = inspect_job(tmp_path, "job-1")
