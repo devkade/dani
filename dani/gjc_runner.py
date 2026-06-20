@@ -4,6 +4,7 @@ import contextlib
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -24,14 +25,16 @@ _GJC_SESSION_PATTERNS = (
 
 
 class GjcRunner:
-    def __init__(self, run_dir: Path) -> None:
+    def __init__(self, run_dir: Path, *, gjc_bin: str | None = None) -> None:
         self.run_dir = run_dir
+        self.gjc_bin = gjc_bin
         self._processes: dict[str, tuple[ManagedProcess, TextIO, TextIO]] = {}
         self._process_groups: dict[str, int] = {}
         self._lock = threading.RLock()
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
     def launch(self, repo_path: Path, job: JobRecord, prompt: str) -> SessionRecord:
+        self._ensure_gjc_available()
         process_handle = self._process_handle(job)
         session_dir = self.run_dir / process_handle
         prompt_path, script_path, stdout_path, stderr_path = self._prepare_session_files(session_dir, prompt)
@@ -48,6 +51,7 @@ class GjcRunner:
         return self._session_record(job, repo_path, process_handle, prompt_path, script_path, stdout_path, stderr_path)
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str) -> SessionRecord:
+        self._ensure_gjc_available()
         if not self.can_resume(omx_session_id):
             msg = f"gjc cannot resume session id: {omx_session_id!r}"
             raise RuntimeError(msg)
@@ -137,8 +141,17 @@ class GjcRunner:
     def _build_script(self, *, repo_path: Path, prompt_path: Path, branch_name: str | None = None) -> str:
         quoted_repo = shlex.quote(str(repo_path))
         quoted_prompt = shlex.quote(str(prompt_path))
+        quoted_gjc = shlex.quote(self._gjc_command())
+        runtime_path = self._runtime_path_export()
         branch_guard = self._build_branch_guard(branch_name)
-        return f'#!/bin/sh\nset -eu\ncd {quoted_repo}\n{branch_guard}exec gjc -p "$(cat {quoted_prompt})"\n'
+        return (
+            "#!/bin/sh\n"
+            "set -eu\n"
+            f"{runtime_path}"
+            f"cd {quoted_repo}\n"
+            f"{branch_guard}"
+            f'exec {quoted_gjc} -p "$(cat {quoted_prompt})"\n'
+        )
 
     def _build_resume_script(
         self,
@@ -150,15 +163,49 @@ class GjcRunner:
     ) -> str:
         quoted_repo = shlex.quote(str(repo_path))
         quoted_prompt = shlex.quote(str(prompt_path))
+        quoted_gjc = shlex.quote(self._gjc_command())
+        runtime_path = self._runtime_path_export()
         quoted_session_id = shlex.quote(gjc_session_id)
         branch_guard = self._build_branch_guard(branch_name)
         return (
             "#!/bin/sh\n"
             "set -eu\n"
+            f"{runtime_path}"
             f"cd {quoted_repo}\n"
             f"{branch_guard}"
-            f'exec gjc --resume {quoted_session_id} -p "$(cat {quoted_prompt})"\n'
+            f'exec {quoted_gjc} --resume {quoted_session_id} -p "$(cat {quoted_prompt})"\n'
         )
+
+    def _gjc_command(self) -> str:
+        configured = (self.gjc_bin or "").strip()
+        if not configured:
+            return "gjc"
+        if "/" in configured:
+            return str(Path(configured).expanduser())
+        return configured
+
+    def _runtime_path_export(self) -> str:
+        command = self._gjc_command()
+        if "/" not in command:
+            return ""
+        bin_dir = Path(command).expanduser().parent
+        return f"export PATH={shlex.quote(str(bin_dir))}:$PATH\n"
+
+    def _ensure_gjc_available(self) -> None:
+        command = self._gjc_command()
+        if "/" in command:
+            path = Path(command).expanduser()
+            if path.is_file() and os.access(path, os.X_OK):
+                return
+            msg = f"configured gjc binary is not executable: {path}"
+            raise RuntimeError(msg)
+        if shutil.which(command):
+            return
+        msg = (
+            f"gjc binary not found on PATH: {command!r}. "
+            "Set DANI_GJC_BIN or config key gjc_bin to an executable gjc path."
+        )
+        raise RuntimeError(msg)
 
     def _branch_name_for_job(self, job: JobRecord) -> str | None:
         branch_name = job.metadata.get("branch_name")

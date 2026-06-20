@@ -74,7 +74,7 @@ def normalize_runtime(runtime: str | None) -> str:
     raise ValueError(msg)
 
 
-def build_agent_runner(runtime: str, run_dir: Path) -> AgentRunner:
+def build_agent_runner(runtime: str, run_dir: Path, *, gjc_bin: str | None = None) -> AgentRunner:
     """Factory returning the AgentRunner matching *runtime* (``omx``, ``omo``, ``gjc``, or ``hermes``)."""
     from dani.gjc_runner import GjcRunner
     from dani.hermes_runner import HermesRunner
@@ -87,7 +87,7 @@ def build_agent_runner(runtime: str, run_dir: Path) -> AgentRunner:
     if normalized == "omo":
         return cast(AgentRunner, OmoHttpRunner(run_dir))
     if normalized == "gjc":
-        return cast(AgentRunner, GjcRunner(run_dir))
+        return cast(AgentRunner, GjcRunner(run_dir, gjc_bin=gjc_bin))
     if normalized == "hermes":
         return cast(AgentRunner, HermesRunner(run_dir))
     msg = f"unknown agent runtime: {runtime!r} (expected 'omx', 'omo', 'gjc', or 'hermes')"

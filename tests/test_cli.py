@@ -196,6 +196,39 @@ def test_build_config_rejects_unknown_issue_ready_launch(tmp_path: Path, monkeyp
         cli_module.build_config(data_dir)
 
 
+def test_build_config_reads_gjc_bin_from_config_file(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"gjc_bin": "/opt/gjc"}), encoding="utf-8")
+    monkeypatch.delenv("DANI_GJC_BIN", raising=False)
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.gjc_bin == "/opt/gjc"
+
+
+def test_build_config_gjc_bin_env_overrides_config_file(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"gjc_bin": "/opt/gjc"}), encoding="utf-8")
+    monkeypatch.setenv("DANI_GJC_BIN", "/Users/devkade/.bun/bin/gjc")
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.gjc_bin == "/Users/devkade/.bun/bin/gjc"
+
+
+def test_build_config_reads_nested_gjc_bin(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / ".dani"
+    data_dir.mkdir()
+    (data_dir / "config.json").write_text(json.dumps({"gjc": {"bin": "/opt/gjc"}}), encoding="utf-8")
+    monkeypatch.delenv("DANI_GJC_BIN", raising=False)
+
+    config = cli_module.build_config(data_dir)
+
+    assert config.gjc_bin == "/opt/gjc"
+
+
 def test_build_config_reads_repo_concurrency_from_env(tmp_path: Path, monkeypatch) -> None:
     data_dir = tmp_path / ".dani"
     data_dir.mkdir()

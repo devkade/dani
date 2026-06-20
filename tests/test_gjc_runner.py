@@ -15,6 +15,9 @@ def test_runtime_factory_accepts_gjc(tmp_path: Path) -> None:
     assert normalize_runtime("gjc") == "gjc"
     assert normalize_runtime("gajae-code") == "gjc"
     assert isinstance(build_agent_runner("gjc", tmp_path / "runs"), GjcRunner)
+    configured = build_agent_runner("gjc", tmp_path / "configured-runs", gjc_bin="/opt/gjc")
+    assert isinstance(configured, GjcRunner)
+    assert configured.gjc_bin == "/opt/gjc"
 
 
 def test_runtime_inference_accepts_only_gjc_ids_and_gjc_session_paths() -> None:
@@ -54,6 +57,57 @@ def test_build_script_uses_gjc_print_mode(tmp_path: Path) -> None:
 
     assert "exec gjc -p" in script
     assert "$(cat" in script
+
+
+def test_build_script_uses_configured_gjc_binary(tmp_path: Path) -> None:
+    runner = GjcRunner(run_dir=tmp_path / "runs", gjc_bin="/Users/devkade/.bun/bin/gjc")
+
+    script = runner._build_script(repo_path=tmp_path / "repo", prompt_path=tmp_path / "prompt.txt")
+
+    assert "export PATH=/Users/devkade/.bun/bin:$PATH" in script
+    assert "exec /Users/devkade/.bun/bin/gjc -p" in script
+
+
+def test_build_resume_script_uses_configured_gjc_binary(tmp_path: Path) -> None:
+    runner = GjcRunner(run_dir=tmp_path / "runs", gjc_bin="/Users/devkade/.bun/bin/gjc")
+
+    script = runner._build_resume_script(
+        repo_path=tmp_path / "repo",
+        prompt_path=tmp_path / "prompt.txt",
+        gjc_session_id="gjc-session-123",
+    )
+
+    assert "export PATH=/Users/devkade/.bun/bin:$PATH" in script
+    assert "exec /Users/devkade/.bun/bin/gjc --resume gjc-session-123 -p" in script
+
+
+def test_launch_fails_fast_when_configured_gjc_binary_is_not_executable(tmp_path: Path) -> None:
+    runner = GjcRunner(run_dir=tmp_path / "runs", gjc_bin=str(tmp_path / "missing-gjc"))
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    job = JobRecord(repo_full_name="acme/demo", stage="implementation", issue_number=7)
+
+    with pytest.raises(RuntimeError, match="configured gjc binary is not executable"):
+        runner.launch(repo_path, job, "Implement issue 7.")
+
+
+def test_launch_falls_back_to_bare_gjc_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gjc = bin_dir / "gjc"
+    fake_gjc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_gjc.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    runner = GjcRunner(run_dir=tmp_path / "runs")
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+    monkeypatch.setattr("dani.gjc_runner.subprocess.Popen", lambda *args, **kwargs: _Process(returncode=0))
+    monkeypatch.setattr("dani.gjc_runner.os.getpgid", lambda pid: 9876)
+    job = JobRecord(repo_full_name="acme/demo", stage="implementation", issue_number=7)
+
+    session = runner.launch(repo_path, job, "Implement issue 7.")
+
+    assert "exec gjc -p" in Path(session.script_path).read_text(encoding="utf-8")
 
 
 def test_build_resume_script_uses_gjc_resume_and_print_mode(tmp_path: Path) -> None:
@@ -126,7 +180,10 @@ def test_close_session_signals_process_group_when_available(tmp_path: Path, monk
 
 
 def test_launch_persists_run_artifacts_with_gjc_runtime_handle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    runner = GjcRunner(run_dir=tmp_path / "runs")
+    fake_gjc = tmp_path / "gjc"
+    fake_gjc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_gjc.chmod(0o755)
+    runner = GjcRunner(run_dir=tmp_path / "runs", gjc_bin=str(fake_gjc))
     repo_path = tmp_path / "repo"
     repo_path.mkdir()
     started: list[dict[str, object]] = []
@@ -146,5 +203,5 @@ def test_launch_persists_run_artifacts_with_gjc_runtime_handle(tmp_path: Path, m
 
     assert session.runtime_handle.startswith("dani-gjc-implementation-")
     assert Path(session.prompt_path).read_text(encoding="utf-8") == "Implement issue 7."
-    assert "exec gjc -p" in Path(session.script_path).read_text(encoding="utf-8")
+    assert str(fake_gjc) in Path(session.script_path).read_text(encoding="utf-8")
     assert started[0]["cwd"] == str(repo_path)

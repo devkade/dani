@@ -41,6 +41,7 @@ Optional environment variables:
   - `omo` / `oh-my-openagents` / `oh-my-openagent` / `opencode`
   - `gjc` / `gajae-code`
   - `hermes`
+- `DANI_GJC_BIN` — absolute or PATH-resolved GJC binary for `gjc` runtime jobs.
 - `DANI_AGENT_TIMEOUT_SECONDS` — overrides the per-job agent wait timeout in seconds.
 - `DANI_ISSUE_READY_LAUNCH` — selects what happens after a reviewer marks an issue ready:
   - `manual` (default) waits for maintainer `/approve`.
@@ -53,6 +54,7 @@ Optional config file (`~/.dani/config.json` by default, or `<data-dir>/config.js
   "agent_runtime": "omx",
   "agent_timeout_seconds": 3600,
   "issue_ready_launch": "manual",
+  "gjc_bin": "/Users/devkade/.bun/bin/gjc",
   "role_bindings": {
     "reviewer": {"runtime": "hermes", "profile": "reviewer-profile"}
   }
@@ -60,8 +62,10 @@ Optional config file (`~/.dani/config.json` by default, or `<data-dir>/config.js
 ```
 
 `agent_timeout_seconds` defaults to `3600`; `issue_ready_launch` defaults to
-`manual`. The corresponding environment variables take precedence over the
-config file when set.
+`manual`. `gjc_bin` is optional and supports the nested aliases
+`{"gjc": {"bin": "..."}}`, `{"gjc": {"binary": "..."}}`, and
+`{"gjc": {"path": "..."}}`. The corresponding environment variables take
+precedence over the config file when set.
 
 `role_bindings.<role>.runtime` overrides the global `agent_runtime` for that role.
 `role_bindings.<role>.profile` is a Hermes-only option: Dani passes it to
@@ -111,9 +115,12 @@ dani at it.
 
 ## Gajae Code (GJC) prerequisite
 When running with `DANI_AGENT_RUNTIME=gjc`, dani launches GJC in
-non-interactive print mode with `gjc -p` and resumes only when a trustworthy
-GJC session id or session file path is available. Install `gjc` and trust the
-target repository at least once in GJC before using webhook automation there.
+non-interactive print mode with `gjc -p`, or with the executable configured by
+`DANI_GJC_BIN` / `gjc_bin`. Dani validates a configured binary before launch,
+adds its directory to the generated script `PATH`, and resumes only when a
+trustworthy GJC session id or session file path is available. Install `gjc` and
+trust the target repository at least once in GJC before using webhook automation
+there.
 Dani maps its GitHub-driven stages onto GJC workflow semantics instead of
 handing native `.gjc` workflow state directly to `ralplan` or `ultragoal`:
 planning jobs produce ralplan-style pending-approval comments, approved

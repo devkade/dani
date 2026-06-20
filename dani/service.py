@@ -97,7 +97,9 @@ class DaniService:
         self.storage = storage or JsonStorage(config)
         self.github = github or GitHubCLI()
         preferred_runtime = normalize_runtime(config.agent_runtime)
-        self.omx_runner: AgentRunner = omx_runner or build_agent_runner(preferred_runtime, config.run_dir)
+        self.omx_runner: AgentRunner = omx_runner or build_agent_runner(
+            preferred_runtime, config.run_dir, gjc_bin=config.gjc_bin
+        )
         self._runtime_runners: dict[str, AgentRunner] = {preferred_runtime: self.omx_runner}
         if runtime_runners:
             self._runtime_runners.update({normalize_runtime(name): runner for name, runner in runtime_runners.items()})
@@ -1426,7 +1428,7 @@ class DaniService:
         normalized = normalize_runtime(runtime)
         runner = self._runtime_runners.get(normalized)
         if runner is None:
-            runner = build_agent_runner(normalized, self.config.run_dir)
+            runner = build_agent_runner(normalized, self.config.run_dir, gjc_bin=self.config.gjc_bin)
             self._runtime_runners[normalized] = runner
         return runner
 
