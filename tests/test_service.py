@@ -303,6 +303,13 @@ def test_issue_opened_carries_reviewer_role_policy(tmp_path: Path) -> None:
     assert job.metadata["role"] == "reviewer"
     assert job.metadata["route_reason"] == "issue_opened"
     assert job.metadata["target"]["issue_number"] == 22
+    assert job.metadata["source_event"]["kind"] == "issue_opened"
+    assert job.metadata["source_event"]["number"] == 22
+    assert job.metadata["route_decision"] == {
+        "from": "issue_opened",
+        "to": "issue_readiness_review",
+        "because": "issue_opened",
+    }
     assert "push_commits" in job.metadata["forbidden_actions"]
     session = service.storage.list_sessions()[0]
     assert session.role == "reviewer"
@@ -677,6 +684,13 @@ def test_check_status_queues_reviewer_check_review(tmp_path: Path) -> None:
     assert job is not None
     assert job.role == "reviewer"
     assert job.metadata["route_reason"] == "check_status_completed"
+    assert job.metadata["source_event"]["kind"] == "check_status"
+    assert job.metadata["source_event"]["pr"] == 88
+    assert job.metadata["route_decision"] == {
+        "from": "check_status",
+        "to": "check_review",
+        "because": "check_status_completed",
+    }
     assert omx_runner.launches[-1]["job"].stage == "check_review"
 
 
@@ -2748,6 +2762,15 @@ def test_agent_managed_pr_review_keeps_originating_branch_and_worktree(tmp_path:
     assert work_line.branch_name == implementation_branch
     assert work_line.worktree_path == str(implementation_worktree)
     assert work_line.agent_run_ids == [implementation_job.session_id, review_job.session_id, fix_job.session_id]
+    assert fix_job.metadata["route_reason"] == "review_round_changes_requested"
+    assert fix_job.metadata["source_event"]["signature_stage"] == "review_round"
+    assert fix_job.metadata["source_event"]["signature_job"] == review_job.id
+    assert fix_job.metadata["source_event"]["review_verdict"] is None
+    assert fix_job.metadata["route_decision"] == {
+        "from": "review_round",
+        "to": "implementation",
+        "because": "review requested changes",
+    }
 
 
 def test_external_pr_opened_queues_review_round(tmp_path: Path) -> None:
