@@ -68,6 +68,21 @@ def test_build_script_uses_configured_gjc_binary(tmp_path: Path) -> None:
     assert "exec /Users/devkade/.bun/bin/gjc -p" in script
 
 
+def test_build_script_resolves_configured_gjc_binary_on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gjc = bin_dir / "custom-gjc"
+    fake_gjc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_gjc.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    runner = GjcRunner(run_dir=tmp_path / "runs", gjc_bin="custom-gjc")
+
+    script = runner._build_script(repo_path=tmp_path / "repo", prompt_path=tmp_path / "prompt.txt")
+
+    assert f"export PATH={bin_dir}:$PATH" in script
+    assert f"exec {fake_gjc} -p" in script
+
+
 def test_build_resume_script_uses_configured_gjc_binary(tmp_path: Path) -> None:
     runner = GjcRunner(run_dir=tmp_path / "runs", gjc_bin="/Users/devkade/.bun/bin/gjc")
 
@@ -79,6 +94,27 @@ def test_build_resume_script_uses_configured_gjc_binary(tmp_path: Path) -> None:
 
     assert "export PATH=/Users/devkade/.bun/bin:$PATH" in script
     assert "exec /Users/devkade/.bun/bin/gjc --resume gjc-session-123 -p" in script
+
+
+def test_build_resume_script_resolves_configured_gjc_binary_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_gjc = bin_dir / "custom-gjc"
+    fake_gjc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_gjc.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    runner = GjcRunner(run_dir=tmp_path / "runs", gjc_bin="custom-gjc")
+
+    script = runner._build_resume_script(
+        repo_path=tmp_path / "repo",
+        prompt_path=tmp_path / "prompt.txt",
+        gjc_session_id="gjc-session-123",
+    )
+
+    assert f"export PATH={bin_dir}:$PATH" in script
+    assert f"exec {fake_gjc} --resume gjc-session-123 -p" in script
 
 
 def test_launch_fails_fast_when_configured_gjc_binary_is_not_executable(tmp_path: Path) -> None:

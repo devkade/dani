@@ -182,7 +182,7 @@ class GjcRunner:
             return "gjc"
         if "/" in configured:
             return str(Path(configured).expanduser())
-        return configured
+        return shutil.which(configured) or configured
 
     def _runtime_path_export(self) -> str:
         command = self._gjc_command()
