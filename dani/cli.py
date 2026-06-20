@@ -128,6 +128,7 @@ def _resolve_repo_concurrency(config_payload: dict[str, object]) -> int:
         value = env_value
     return _parse_positive_int(value, name="repo_concurrency")
 
+
 def _resolve_issue_ready_launch(config_payload: dict[str, object]) -> str:
     value = os.environ.get("DANI_ISSUE_READY_LAUNCH") or config_payload.get(
         "issue_ready_launch", ISSUE_READY_LAUNCH_MANUAL
@@ -147,7 +148,6 @@ def _resolve_issue_ready_launch(config_payload: dict[str, object]) -> str:
         msg = f"issue_ready_launch must be one of: {allowed}"
         raise typer.BadParameter(msg)
     return launch
-
 
 
 def build_config(data_dir: Path, host: str = "127.0.0.1", port: int = 8787) -> DaniConfig:

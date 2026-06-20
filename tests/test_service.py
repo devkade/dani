@@ -9,6 +9,7 @@ import pytest
 from dani.agent_runner import AgentRunner
 from dani.errors import ClaudeUsageLimitError, RolloutMissingError
 from dani.github import GitHubCLI
+from dani.hermes_runner import HermesRunner
 from dani.models import (
     RUNTIME_GJC,
     RUNTIME_HERMES,
@@ -88,11 +89,14 @@ def add_exact_review_signature(github: FakeGitHubCLI, job: JobRecord) -> None:
         build_signature(**signature_fields),
     )
 
+
 def add_ready_issue_signature(github: FakeGitHubCLI, repo_full_name: str, issue_number: int) -> None:
     github.add_issue_signature(
         repo_full_name,
         issue_number,
-        build_signature(stage="issue_readiness_review", job=f"reviewer-{issue_number}", issue=issue_number, readiness="ready"),
+        build_signature(
+            stage="issue_readiness_review", job=f"reviewer-{issue_number}", issue=issue_number, readiness="ready"
+        ),
     )
 
 
@@ -155,6 +159,8 @@ def make_omo_preferred_service(
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, omo_runner, omx_runner
+
+
 def make_gjc_bound_service(tmp_path: Path) -> tuple[DaniService, FakeGitHubCLI, FakeRuntimeRunner]:
     config = DaniConfig(
         data_dir=tmp_path / ".dani",
@@ -209,7 +215,6 @@ def make_hermes_reviewer_service(
     )
     service.register_repo("acme/demo", str(tmp_path))
     return service, github, hermes_runner, omx_runner
-
 
 
 def make_pr_event(
@@ -273,6 +278,7 @@ def test_issue_readiness_review_persists_omx_session_id(tmp_path: Path) -> None:
     session = service.storage.list_sessions()[0]
     assert session.omx_session_id == "omx-" + session.job_id
 
+
 def test_issue_opened_carries_reviewer_role_policy(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
 
@@ -304,6 +310,8 @@ def test_issue_opened_carries_reviewer_role_policy(tmp_path: Path) -> None:
     assert "Dani role policy:" in prompt
     assert "- Role: reviewer" in prompt
     assert "Forbidden actions: push_commits" in prompt
+
+
 def test_role_bound_gjc_runtime_dispatches_and_persists_metadata(tmp_path: Path) -> None:
     service, _, gjc_runner = make_gjc_bound_service(tmp_path)
 
@@ -453,6 +461,86 @@ def test_gjc_runtime_failure_does_not_fallback_to_omx(tmp_path: Path) -> None:
     assert cast(FakeRuntimeRunner, service.omx_runner).launches == []
 
 
+def test_planner_followup_requeues_readiness_review_with_reviewer_hermes_profile(tmp_path: Path) -> None:
+    class CompletingHermesRunner(HermesRunner):
+        def __init__(self, run_dir: Path, github: FakeGitHubCLI) -> None:
+            super().__init__(run_dir)
+            self.github = github
+            self.launches: list[SessionRecord] = []
+
+        def _start_process(
+            self, process_handle: str, script_path: Path, repo_path: Path, stdout_path: Path, stderr_path: Path
+        ) -> None:
+            del process_handle, script_path, repo_path
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text("", encoding="utf-8")
+
+        def launch(self, repo_path: Path, job: JobRecord, prompt: str) -> SessionRecord:
+            session = super().launch(repo_path, job, prompt)
+            self.launches.append(session)
+            if job.stage == "issue_readiness_review":
+                self.github.add_issue_signature(
+                    job.repo_full_name,
+                    int(job.issue_number or 0),
+                    build_signature(
+                        stage="issue_readiness_review",
+                        job=job.id,
+                        issue=int(job.issue_number or 0),
+                        readiness="ready",
+                    ),
+                )
+            return session
+
+    config = DaniConfig(
+        data_dir=tmp_path / ".dani",
+        webhook_secret=TEST_SECRET,
+        agent_runtime=RUNTIME_OMX,
+        role_bindings={
+            "reviewer": {"runtime": RUNTIME_HERMES, "profile": "warden"},
+            "planner": {"runtime": RUNTIME_HERMES, "profile": "coding"},
+        },
+    )
+    storage = JsonStorage(config)
+    github = FakeGitHubCLI()
+    hermes_runner = CompletingHermesRunner(config.run_dir, github)
+    service = DaniService(
+        config,
+        storage=storage,
+        github=cast(GitHubCLI, github),
+        omx_runner=cast(AgentRunner, FakeRuntimeRunner(github, runtime_name=RUNTIME_OMX)),
+        dev_syncer=FakeGitDevSyncer(),
+        runtime_runners={RUNTIME_HERMES: cast(AgentRunner, hermes_runner)},
+        work_line_manager=FakeWorkLineManager(),
+    )
+    service.register_repo("acme/demo", str(tmp_path))
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=13,
+            actor_login="planner-bot",
+            payload={"issue": {"body": "context"}},
+            body=build_signature(stage="issue_followup", job="planner-job", issue=13),
+            title="Needs follow-up",
+        )
+    )
+    service.wait_for_idle()
+
+    job = service.storage.get_job(result["job_id"])
+    assert job is not None
+    assert job.stage == "issue_readiness_review"
+    assert job.role == "reviewer"
+    assert job.metadata["role"] == "reviewer"
+    assert job.metadata["role_binding"]["role"] == "reviewer"
+    assert job.metadata["hermes_profile"] == "warden"
+    assert job.metadata["route_reason"] == "issue_readiness_review"
+
+    assert len(hermes_runner.launches) == 1
+    script = Path(hermes_runner.launches[0].script_path).read_text(encoding="utf-8")
+    assert "exec hermes -p warden chat -q" in script
+    assert "exec hermes -p coding chat -q" not in script
 
 
 def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Path) -> None:
@@ -496,6 +584,7 @@ def test_approve_with_not_ready_signature_queues_planner_refinement(tmp_path: Pa
     assert jobs[-1].role == "planner"
     assert jobs[-1].metadata["readiness"] == "needs_refinement"
     assert omx_runner.launches[-1]["job"].stage == "issue_followup"
+
 
 def test_reviewer_ready_signature_waits_for_manual_approve_by_default(tmp_path: Path) -> None:
     service, _, omx_runner = make_service(tmp_path)
@@ -821,9 +910,7 @@ def test_issue_followup_after_omo_fallback_continues_on_omx_session(tmp_path: Pa
     )
     service.wait_for_idle()
 
-    review_job = service.storage.find_jobs(
-        repo_full_name="acme/demo", stage="issue_followup", issue_number=53
-    )[-1]
+    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="issue_followup", issue_number=53)[-1]
     assert result["stage"] == "issue_followup"
     assert review_job.status == "completed"
     assert review_job.metadata["effective_runtime"] == RUNTIME_OMX
@@ -942,7 +1029,9 @@ def test_issue_comment_with_unresumable_prior_session_falls_back_to_fresh_issue_
     followup_jobs = [
         job for job in service.storage.list_jobs() if job.stage == "issue_followup" and job.issue_number == 731
     ]
-    assert followup_jobs, "expected a fresh issue_followup to be enqueued when prior planner session id is non-resumable"
+    assert followup_jobs, (
+        "expected a fresh issue_followup to be enqueued when prior planner session id is non-resumable"
+    )
     assert not omx_runner.resumes, "runner.resume must not be invoked when can_resume returned False"
     new_job = followup_jobs[-1]
     assert new_job.metadata["rerouted_from"] == "issue_followup"
@@ -4694,12 +4783,18 @@ class MissingIssueCommentRunner(FakeOmxRunner):
                 review_round=job.review_round,
                 omx_session_id=f"omx-{job.id}" if self.resumable else None,
             )
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"} and self.recover:
+        if (
+            job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}
+            and self.recover
+        ):
             self._post_recovery_signature(job)
         return super().launch(repo_path, job, prompt)
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str):
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"} and self.recover:
+        if (
+            job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}
+            and self.recover
+        ):
             self._post_recovery_signature(job)
         self.resumes.append({
             "repo_path": str(repo_path),
@@ -4771,9 +4866,7 @@ def test_issue_readiness_missing_signature_recovers_with_original_signature(tmp_
     jobs = service.storage.list_jobs()
     source_job = jobs[0]
     recovery_job = jobs[1]
-    expected_signature = build_signature(
-        stage="issue_readiness_review", job=source_job.id, issue=40, readiness="ready"
-    )
+    expected_signature = build_signature(stage="issue_readiness_review", job=source_job.id, issue=40, readiness="ready")
     assert source_job.stage == "issue_readiness_review"
     assert source_job.status == "completed"
     assert source_job.metadata["comment_recovery_attempts"] == 1
@@ -4947,7 +5040,10 @@ class ResumeWaitFailureRecoveryRunner(MissingIssueCommentRunner):
         self.post_before_failure = post_before_failure
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str):
-        if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"} and self.post_before_failure:
+        if (
+            job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}
+            and self.post_before_failure
+        ):
             self._post_recovery_signature(job)
         session = super().resume(repo_path, job, prompt, omx_session_id)
         if job.stage in {"issue_request_recovery", "issue_followup_recovery", "issue_readiness_review_recovery"}:
@@ -5200,9 +5296,7 @@ def test_issue_readiness_recovery_does_not_fresh_launch_when_resume_exception_po
     service.wait_for_idle()
 
     source_job, recovery_job = service.storage.list_jobs()
-    expected_signature = build_signature(
-        stage="issue_readiness_review", job=source_job.id, issue=50, readiness="ready"
-    )
+    expected_signature = build_signature(stage="issue_readiness_review", job=source_job.id, issue=50, readiness="ready")
     matching_comments = github.find_comments_by_signature(
         "acme/demo", 50, kind="issue", signature_fragment=expected_signature
     )
@@ -5244,9 +5338,7 @@ def test_issue_readiness_recovery_does_not_fresh_launch_when_failed_resume_poste
     service.wait_for_idle()
 
     source_job, recovery_job = service.storage.list_jobs()
-    expected_signature = build_signature(
-        stage="issue_readiness_review", job=source_job.id, issue=47, readiness="ready"
-    )
+    expected_signature = build_signature(stage="issue_readiness_review", job=source_job.id, issue=47, readiness="ready")
     matching_comments = github.find_comments_by_signature(
         "acme/demo", 47, kind="issue", signature_fragment=expected_signature
     )

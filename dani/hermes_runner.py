@@ -44,7 +44,9 @@ class HermesRunner:
         with self._lock:
             self._profiles[process_handle] = profile
         self._start_process(process_handle, script_path, repo_path, stdout_path, stderr_path)
-        return self._session_record(job, repo_path, process_handle, prompt_path, script_path, stdout_path, stderr_path, profile)
+        return self._session_record(
+            job, repo_path, process_handle, prompt_path, script_path, stdout_path, stderr_path, profile
+        )
 
     def resume(self, repo_path: Path, job: JobRecord, prompt: str, omx_session_id: str) -> SessionRecord:
         del repo_path, job, prompt, omx_session_id

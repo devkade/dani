@@ -13,7 +13,9 @@ class FakeGitHubCLI:
     def __init__(self) -> None:
         self.ensure_pull_requests: list[dict[str, str]] = []
 
-    def ensure_pull_request(self, repo_full_name: str, *, head: str, base: str, title: str, body: str) -> dict[str, str]:
+    def ensure_pull_request(
+        self, repo_full_name: str, *, head: str, base: str, title: str, body: str
+    ) -> dict[str, str]:
         payload = {
             "repo_full_name": repo_full_name,
             "head": head,
