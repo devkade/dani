@@ -253,11 +253,14 @@ def _active_worker_targets_terminal_pr(
 
 def _active_worker_targets_closed_or_merged_pr(job: dict[str, Any], *, stage: str, role: Any) -> bool:
     metadata = _dict(job.get("metadata"))
+    source_event = _dict(metadata.get("source_event"))
+    pr_state = source_event.get("pr_state", metadata.get("pr_state"))
+    pr_merged = source_event.get("pr_merged", metadata.get("pr_merged"))
     return (
         job.get("status") in ACTIVE_JOB_STATUSES
         and stage == "implementation"
         and role == "worker"
-        and (metadata.get("pr_state") == "closed" or metadata.get("pr_merged") is True)
+        and (pr_state == "closed" or pr_merged is True)
     )
 
 

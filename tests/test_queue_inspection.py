@@ -138,6 +138,8 @@ def test_queue_doctor_json_flags_closed_and_merged_worker_jobs(tmp_path: Path) -
     jobs = [
         _job("closed-metadata", "implementation", "worker", metadata={"pr_state": "closed"}),
         _job("merged-metadata", "implementation", "worker", metadata={"pr_merged": True}),
+        _job("closed-source-event", "implementation", "worker", metadata={"source_event": {"pr_state": "closed"}}),
+        _job("merged-source-event", "implementation", "worker", metadata={"source_event": {"pr_merged": True}}),
     ]
     _write_state(tmp_path, jobs=jobs)
 
@@ -146,7 +148,12 @@ def test_queue_doctor_json_flags_closed_and_merged_worker_jobs(tmp_path: Path) -
     assert result.exit_code == 2
     payload = json.loads(result.stdout)
     findings = [item for item in payload["failures"] if item["code"] == "active_worker_targets_terminal_pr"]
-    assert {item["job_id"] for item in findings} == {"closed-metadata", "merged-metadata"}
+    assert {item["job_id"] for item in findings} == {
+        "closed-metadata",
+        "merged-metadata",
+        "closed-source-event",
+        "merged-source-event",
+    }
 
 
 def test_inspect_job_renders_route_session_and_work_line(tmp_path: Path) -> None:
