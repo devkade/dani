@@ -531,6 +531,8 @@ def test_config_env_warn_on_bad_runtime(tmp_path: Path):
     result = _check_config_env(ctx)
     assert result.status == CheckStatus.WARN
     assert "made-up" in result.summary
+
+
 def test_config_env_accepts_gjc_runtime(tmp_path: Path):
     ctx = _make_ctx(
         tmp_path,
@@ -545,8 +547,6 @@ def test_config_env_accepts_gjc_runtime(tmp_path: Path):
 
     assert result.status == CheckStatus.OK
     assert result.details["agent_runtime"] == "gjc"
-
-
 
 
 def test_config_env_fail_on_config_parse_error(tmp_path: Path):
@@ -606,6 +606,8 @@ def test_binaries_omo_runtime_fails_without_opencode(tmp_path: Path, monkeypatch
     result = _check_binaries(ctx)
     assert result.status == CheckStatus.FAIL
     assert "opencode" in result.summary
+
+
 def test_binaries_gjc_runtime_requires_gjc_only_for_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     fake_paths = {
         "git": "/usr/bin/git",
@@ -628,7 +630,6 @@ def test_binaries_gjc_runtime_requires_gjc_only_for_runtime(tmp_path: Path, monk
 def test_process_sprawl_classifies_gjc_print_process() -> None:
     assert _classify_ps_command("/bin/sh -c exec gjc -p prompt") == "gjc_print"
     assert _classify_ps_command("/bin/sh -c exec gjc --resume gjc-session -p prompt") == "gjc_print"
-
 
 
 def test_storage_files_ok(populated_data_dir: Path):

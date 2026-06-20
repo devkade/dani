@@ -462,7 +462,9 @@ class DaniService:
             issue_state=event.issue_state,
             actor_type=event.actor_type,
         )
-        return self._queue_issue_refinement(repo, synthetic, readiness=self._issue_readiness(event.repo_full_name, issue_number))
+        return self._queue_issue_refinement(
+            repo, synthetic, readiness=self._issue_readiness(event.repo_full_name, issue_number)
+        )
 
     def _handle_planner_refinement_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         issue_number = int(signature.get("issue") or event.number)
@@ -539,17 +541,15 @@ class DaniService:
             lineage_runtime = self._resume_runtime_for_session(session)
             lineage_runner = self._runner_for_runtime(lineage_runtime)
             if lineage_runner.can_resume(session.omx_session_id):
-                metadata.update(
-                    {
-                        "omx_session_id": session.omx_session_id,
-                        "preferred_runtime": session.preferred_runtime or normalize_runtime(self.config.agent_runtime),
-                        "effective_runtime": effective_session_runtime(session),
-                        "native_session_runtime": session.native_session_runtime,
-                        "fallback_reason": session.fallback_reason,
-                        "bridge_source_runtime": session.bridge_source_runtime,
-                        "bridge_source_session_id": session.bridge_source_session_id,
-                    }
-                )
+                metadata.update({
+                    "omx_session_id": session.omx_session_id,
+                    "preferred_runtime": session.preferred_runtime or normalize_runtime(self.config.agent_runtime),
+                    "effective_runtime": effective_session_runtime(session),
+                    "native_session_runtime": session.native_session_runtime,
+                    "fallback_reason": session.fallback_reason,
+                    "bridge_source_runtime": session.bridge_source_runtime,
+                    "bridge_source_session_id": session.bridge_source_session_id,
+                })
         job = self._enqueue_job(
             repo,
             stage="issue_followup",
@@ -649,7 +649,6 @@ class DaniService:
             return self._handle_planner_refinement_event(event, signature)
         if stage == ISSUE_READINESS_REVIEW_STAGE and event.kind == "issue_comment":
             return self._handle_issue_readiness_event(event, signature)
-
 
         if stage == "implementation" and event.kind == "pull_request_comment":
             return self._handle_implementation_agent_event(event, signature)
@@ -1399,9 +1398,7 @@ class DaniService:
         if bridge_context.note:
             job.metadata["bridge_note"] = bridge_context.note
 
-    def _update_job_usage_limit_metadata(
-        self, job: JobRecord, usage_limit_error: ClaudeUsageLimitError | None
-    ) -> None:
+    def _update_job_usage_limit_metadata(self, job: JobRecord, usage_limit_error: ClaudeUsageLimitError | None) -> None:
         if usage_limit_error is None:
             return
         job.metadata["usage_limit_runtime"] = RUNTIME_OMO
@@ -1503,7 +1500,9 @@ class DaniService:
         runtime = job.metadata.get("preferred_runtime")
         if isinstance(runtime, str) and runtime:
             return normalize_runtime(runtime)
-        return self._role_binding(job.role or str(job.metadata.get("role") or default_role_for_stage(job.stage))).runtime
+        return self._role_binding(
+            job.role or str(job.metadata.get("role") or default_role_for_stage(job.stage))
+        ).runtime
 
     def _lineage_session_for(self, job: JobRecord) -> SessionRecord | None:
         if job.stage != "issue_followup":
@@ -2467,7 +2466,16 @@ class DaniService:
                 continue
             raw = signature.get("readiness") or signature.get("verdict") or signature.get("status")
             value = str(raw or "").strip().casefold().replace("-", "_")
-            if value in {"ready", "approved", "approve", "ok", "not_ready", "needs_refinement", "refine", "changes_requested"}:
+            if value in {
+                "ready",
+                "approved",
+                "approve",
+                "ok",
+                "not_ready",
+                "needs_refinement",
+                "refine",
+                "changes_requested",
+            }:
                 return
         raise RuntimeError("issue-readiness-review-comment-missing")
 
@@ -2685,6 +2693,19 @@ class DaniService:
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
 
     def _queue_issue_readiness_review(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
+        route_decision = route_event(event)
+        route_reason = (
+            route_decision.reason if event.kind == "issue_opened" and route_decision else ISSUE_READINESS_REVIEW_STAGE
+        )
+        target_metadata = (
+            route_decision.target_metadata
+            if route_decision
+            else {
+                "issue_number": event.number,
+                "event_kind": event.kind,
+                "event_action": event.action,
+            }
+        )
         job = self._enqueue_job(
             repo,
             stage=ISSUE_READINESS_REVIEW_STAGE,
@@ -2696,10 +2717,11 @@ class DaniService:
                 "issue_readiness_state": "pending",
                 "launch_gate_state": "blocked",
             },
-            **self._route_kwargs(event),
+            role=ROLE_REVIEWER,
+            route_reason=route_reason,
+            target_metadata=target_metadata,
         )
         return {"status": "queued", "job_id": job.id, "stage": job.stage}
-
 
     def _queue_dev_sync(self, repo: RepoConfig, event: NormalizedEvent) -> dict[str, Any]:
         if event.ref != f"refs/heads/{repo.main_branch}":
@@ -3017,31 +3039,27 @@ class DaniService:
             lineage_runtime = self._resume_runtime_for_session(session)
             lineage_runner = self._runner_for_runtime(lineage_runtime)
             if lineage_runner.can_resume(session.omx_session_id):
-                metadata.update(
-                    {
-                        "omx_session_id": session.omx_session_id,
-                        "preferred_runtime": session.preferred_runtime or normalize_runtime(self.config.agent_runtime),
-                        "effective_runtime": effective_session_runtime(session),
-                        "native_session_runtime": session.native_session_runtime,
-                        "fallback_reason": session.fallback_reason,
-                        "bridge_source_runtime": session.bridge_source_runtime,
-                        "bridge_source_session_id": session.bridge_source_session_id,
-                    }
-                )
+                metadata.update({
+                    "omx_session_id": session.omx_session_id,
+                    "preferred_runtime": session.preferred_runtime or normalize_runtime(self.config.agent_runtime),
+                    "effective_runtime": effective_session_runtime(session),
+                    "native_session_runtime": session.native_session_runtime,
+                    "fallback_reason": session.fallback_reason,
+                    "bridge_source_runtime": session.bridge_source_runtime,
+                    "bridge_source_session_id": session.bridge_source_session_id,
+                })
             else:
-                metadata.update(
-                    {
-                        "rerouted_from": "issue_followup",
-                        "prior_session_id": session.omx_session_id,
-                        "preferred_runtime": session.preferred_runtime or normalize_runtime(self.config.agent_runtime),
-                        "effective_runtime": effective_session_runtime(session),
-                        "native_session_runtime": session.native_session_runtime,
-                        "fallback_reason": session.fallback_reason,
-                        "bridge_source_runtime": session.bridge_source_runtime,
-                        "bridge_source_session_id": session.bridge_source_session_id,
-                        "disable_resume": True,
-                    }
-                )
+                metadata.update({
+                    "rerouted_from": "issue_followup",
+                    "prior_session_id": session.omx_session_id,
+                    "preferred_runtime": session.preferred_runtime or normalize_runtime(self.config.agent_runtime),
+                    "effective_runtime": effective_session_runtime(session),
+                    "native_session_runtime": session.native_session_runtime,
+                    "fallback_reason": session.fallback_reason,
+                    "bridge_source_runtime": session.bridge_source_runtime,
+                    "bridge_source_session_id": session.bridge_source_session_id,
+                    "disable_resume": True,
+                })
         job = self._enqueue_job(
             repo,
             stage="issue_followup",
@@ -3061,7 +3079,11 @@ class DaniService:
                 continue
             if role is not None:
                 session_role = session.role
-                if role == ROLE_PLANNER and session_role is None and session.stage in {"issue_request", "issue_followup"}:
+                if (
+                    role == ROLE_PLANNER
+                    and session_role is None
+                    and session.stage in {"issue_request", "issue_followup"}
+                ):
                     pass
                 elif session_role != role:
                     continue

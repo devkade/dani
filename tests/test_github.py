@@ -187,9 +187,7 @@ def test_prefers_dani_github_token_env_var(monkeypatch: pytest.MonkeyPatch, fake
     assert used_tokens == ["preferred-token"]
 
 
-def test_ignores_stale_tls_ca_bundle_env_var(
-    monkeypatch: pytest.MonkeyPatch, fake_repo: FakeRepo, tmp_path
-) -> None:
+def test_ignores_stale_tls_ca_bundle_env_var(monkeypatch: pytest.MonkeyPatch, fake_repo: FakeRepo, tmp_path) -> None:
     missing_bundle = str(tmp_path / "missing-cacert.pem")
 
     monkeypatch.setenv("DANI_GITHUB_TOKEN", "token")

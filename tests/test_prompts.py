@@ -47,6 +47,7 @@ def test_implementation_prompt_for_omo_replaces_ralph_with_ultrawork() -> None:
     assert "$ralph" not in prompt
     assert "ultrawork" in prompt
 
+
 def test_implementation_prompt_for_gjc_replaces_ralph_with_gjc_loop() -> None:
     prompt = render_prompt(
         "implementation",
@@ -68,7 +69,6 @@ def test_implementation_prompt_for_gjc_replaces_ralph_with_gjc_loop() -> None:
 
     assert "$ralph" not in prompt
     assert "GJC ultragoal-style execution workflow from the approved ralplan-style plan" in prompt
-
 
 
 def test_implementation_prompt_for_omx_explicit_runtime_still_keeps_ralph() -> None:
@@ -460,6 +460,8 @@ def test_review_round_prompt_for_omo_delegates_to_momus_plan_critic() -> None:
     assert "$code-review" not in prompt
     assert "Momus-Plan-Critic" in prompt
     assert "subagent" in prompt.lower()
+
+
 def test_review_round_prompt_for_gjc_uses_gjc_review_pass() -> None:
     prompt = render_prompt(
         "review_round",
@@ -584,7 +586,6 @@ def test_merge_conflict_resolution_prompt_requires_recheck_without_direct_merge(
     assert "gh pr comment 5 --repo acme/demo --body-file <merge-conflict-comment.md>" in prompt
 
 
-
 def test_issue_request_prompt_for_gjc_uses_ralplan_style_pending_plan() -> None:
     prompt = render_prompt("issue_request", _issue_request_context(), runtime="gjc")
 
@@ -634,8 +635,11 @@ def test_final_verdict_prompt_for_gjc_uses_strict_final_gate() -> None:
     prompt = render_prompt("final_verdict", _final_verdict_context(), runtime="gjc")
 
     assert "strict GJC final gate" in prompt
-    assert "APPROVE only when architecture, product behavior, code quality, and verification evidence are clean" in prompt
+    assert (
+        "APPROVE only when architecture, product behavior, code quality, and verification evidence are clean" in prompt
+    )
     assert "Otherwise REJECT with concrete next actions" in prompt
+
 
 def _final_verdict_context() -> dict[str, object]:
     return {
@@ -703,6 +707,7 @@ def _dev_sync_conflict_context() -> dict[str, object]:
         "commit_message": "Merge main into dev",
     }
 
+
 def _issue_readiness_review_context() -> dict[str, object]:
     return {
         "repo": "acme/demo",
@@ -716,7 +721,6 @@ def _issue_readiness_review_context() -> dict[str, object]:
         "not_ready_signature": "<!-- dani:stage=issue_readiness_review;job=abc;issue=7;readiness=not_ready -->",
         "needs_refinement_signature": "<!-- dani:stage=issue_readiness_review;job=abc;issue=7;readiness=needs_refinement -->",
     }
-
 
 
 _NON_INTERACTIVE_TEMPLATE_CONTEXTS: dict[str, dict[str, object]] = {

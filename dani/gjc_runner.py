@@ -138,13 +138,7 @@ class GjcRunner:
         quoted_repo = shlex.quote(str(repo_path))
         quoted_prompt = shlex.quote(str(prompt_path))
         branch_guard = self._build_branch_guard(branch_name)
-        return (
-            "#!/bin/sh\n"
-            "set -eu\n"
-            f"cd {quoted_repo}\n"
-            f"{branch_guard}"
-            f'exec gjc -p "$(cat {quoted_prompt})"\n'
-        )
+        return f'#!/bin/sh\nset -eu\ncd {quoted_repo}\n{branch_guard}exec gjc -p "$(cat {quoted_prompt})"\n'
 
     def _build_resume_script(
         self,
@@ -281,4 +275,3 @@ class GjcRunner:
         if session_id.startswith(("ses_", "omx-")):
             return False
         return session_id.startswith("gjc-") or "/.gjc/agent/sessions/" in session_id
-

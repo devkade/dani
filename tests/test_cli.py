@@ -28,7 +28,9 @@ class FakeRestartService:
 
     def restart_issue(self, repo_full_name: str, issue_number: int) -> JobRecord:
         self.calls.append(("restart_issue", repo_full_name, issue_number))
-        return JobRecord(repo_full_name=repo_full_name, stage="issue_readiness_review", issue_number=issue_number, id="job-123")
+        return JobRecord(
+            repo_full_name=repo_full_name, stage="issue_readiness_review", issue_number=issue_number, id="job-123"
+        )
 
     def wait_for_idle(self) -> None:
         self.calls.append(("wait_for_idle", None))
@@ -162,6 +164,7 @@ def test_build_config_reads_max_issue_followups_from_config_file(tmp_path: Path,
     config = cli_module.build_config(data_dir)
 
     assert config.max_issue_followups == 7
+
 
 def test_build_config_reads_issue_ready_launch_from_config_file(tmp_path: Path, monkeypatch) -> None:
     data_dir = tmp_path / ".dani"

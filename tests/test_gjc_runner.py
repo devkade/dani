@@ -15,12 +15,12 @@ def test_runtime_factory_accepts_gjc(tmp_path: Path) -> None:
     assert normalize_runtime("gjc") == "gjc"
     assert normalize_runtime("gajae-code") == "gjc"
     assert isinstance(build_agent_runner("gjc", tmp_path / "runs"), GjcRunner)
+
+
 def test_runtime_inference_accepts_only_gjc_ids_and_gjc_session_paths() -> None:
     assert infer_runtime_from_session_id("gjc-session-123") == RUNTIME_GJC
     assert infer_runtime_from_session_id("/Users/me/.gjc/agent/sessions/session.jsonl") == RUNTIME_GJC
     assert infer_runtime_from_session_id("not-gjc/session.jsonl") == RUNTIME_OMX
-
-
 
 
 class _Process:
