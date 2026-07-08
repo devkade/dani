@@ -111,7 +111,9 @@ class DaniService:
         self.storage = storage or JsonStorage(config)
         self.github = github or GitHubCLI()
         preferred_runtime = normalize_runtime(config.agent_runtime)
-        self.omx_runner: AgentRunner = omx_runner or build_agent_runner(preferred_runtime, config.run_dir)
+        self.omx_runner: AgentRunner = omx_runner or build_agent_runner(
+            preferred_runtime, config.run_dir, gjc_bin=config.gjc_bin
+        )
         self._runtime_runners: dict[str, AgentRunner] = {preferred_runtime: self.omx_runner}
         if runtime_runners:
             self._runtime_runners.update({normalize_runtime(name): runner for name, runner in runtime_runners.items()})
@@ -1208,6 +1210,9 @@ class DaniService:
             return
 
         if job.stage == "implementation":
+            if job.pr_number and not self._is_pr_open(job.repo_full_name, int(job.pr_number)):
+                job.metadata = {**job.metadata, "skip_reason": "pr_not_open"}
+                return
             self._ensure_work_line(repo, job)
 
         preferred_runtime = self._preferred_runtime_for(job)
@@ -1511,7 +1516,7 @@ class DaniService:
         normalized = normalize_runtime(runtime)
         runner = self._runtime_runners.get(normalized)
         if runner is None:
-            runner = build_agent_runner(normalized, self.config.run_dir)
+            runner = build_agent_runner(normalized, self.config.run_dir, gjc_bin=self.config.gjc_bin)
             self._runtime_runners[normalized] = runner
         return runner
 
@@ -3439,7 +3444,7 @@ class DaniService:
 
     def _is_pr_open(self, repo_full_name: str, pr_number: int) -> bool:
         pull_request = self.github.get_pull_request(repo_full_name, pr_number)
-        return pull_request.get("state") == "open"
+        return pull_request.get("state") == "open" and pull_request.get("merged") is not True
 
     def _pull_request_metadata(self, repo_full_name: str, pr_number: int) -> dict[str, str]:
         for pull_request in self.github.list_pull_requests(repo_full_name):

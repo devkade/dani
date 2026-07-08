@@ -206,6 +206,7 @@ Requirements:
   - If a PR already exists, push new commits to the same branch so the PR updates automatically
   - Update the PR body only if needed to keep the description/signature accurate
   - Use `Closes #$issue_number` only when the PR fully implements the issue. If the PR is partial, describe the remaining scope and avoid auto-closing keywords.
+  - For existing PR follow-ups: If no code, PR body, or branch update was needed, do not post a PR comment. Post a PR comment only when the follow-up changed code, the PR body, or the branch.
 $signature_instructions
 
 After creating or updating the PR, exit.

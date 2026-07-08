@@ -167,6 +167,7 @@ class DaniConfig:
     max_issue_followups: int = DEFAULT_MAX_ISSUE_FOLLOWUPS
     repo_concurrency: int = 1
     issue_ready_launch: str = ISSUE_READY_LAUNCH_MANUAL
+    gjc_bin: str | None = None
 
     @property
     def config_path(self) -> Path:

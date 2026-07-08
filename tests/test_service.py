@@ -2046,6 +2046,77 @@ def test_review_fix_reuses_original_isolated_work_line(tmp_path: Path) -> None:
     assert work_line.agent_run_ids == [initial_job.session_id, review_job.session_id, review_fix_job.session_id]
 
 
+def test_needs_change_review_round_routes_to_implementation(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
+    service.handle_event(
+        NormalizedEvent(
+            kind="issue_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=11,
+            actor_login="acme",
+            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
+            body="/approve",
+            title="Need automation",
+        )
+    )
+    service.wait_for_idle()
+    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
+    service.handle_event(
+        make_pr_comment_event(
+            pr_number=101,
+            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
+        )
+    )
+    service.wait_for_idle()
+    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
+
+    review_body = (
+        "STATUS: NEEDS_CHANGE\n\n"
+        "- Add coverage for the missing edge case.\n\n"
+        f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
+    )
+    result = service.handle_event(make_pr_comment_event(pr_number=101, body=review_body))
+    service.wait_for_idle()
+
+    implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)[
+        -1
+    ]
+    assert result["stage"] == "implementation"
+    assert result["review_status"] == "NEEDS_CHANGE"
+    assert implementation_job.metadata["review_comment_body"] == review_body
+    assert implementation_job.metadata["triggering_review_status"] == "NEEDS_CHANGE"
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101) == []
+
+
+
+def test_queued_implementation_skips_launch_when_pr_closed(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    github.add_pull_request(
+        "acme/demo",
+        101,
+        build_signature(stage="implementation", job="initial", issue=11, pr=101),
+        title="Feature/#11",
+    )
+    job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="implementation",
+            role="worker",
+            issue_number=11,
+            pr_number=101,
+            metadata={"title": "Feature/#11", "body": ""},
+        )
+    )
+    github.close_pull_request("acme/demo", 101)
+    repo = service.storage.get_repo("acme/demo")
+    assert repo is not None
+
+    service._run_job_attempt(repo, job)
+
+    assert omx_runner.launches == []
+    assert job.metadata["skip_reason"] == "pr_not_open"
 
 def test_review_fix_loop_repeats_in_same_work_line_until_final_approval(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
@@ -2817,12 +2888,9 @@ def test_agent_managed_pr_review_keeps_originating_branch_and_worktree(tmp_path:
             number=int(implementation_pr["number"]),
             actor_login="agent",
             payload={},
-            body=build_signature(
-                stage="review_round",
-                job=review_job.id,
-                pr=int(implementation_pr["number"]),
-                round=1,
-                issue=12,
+            body=(
+                "Verdict: changes_requested\n"
+                f"{build_signature(stage='review_round', job=review_job.id, pr=int(implementation_pr['number']), round=1, issue=12)}"
             ),
             title=str(implementation_pr["title"]),
             is_pull_request=True,
@@ -3050,7 +3118,7 @@ def test_external_review_comment_queues_implementation_like_internal_pr(tmp_path
     result = service.handle_event(
         make_pr_comment_event(
             pr_number=88,
-            body=build_signature(stage="review_round", job=review_job.id, pr=88, round=1),
+            body=f"Verdict: changes_requested\n{build_signature(stage='review_round', job=review_job.id, pr=88, round=1)}",
         )
     )
     service.wait_for_idle()
@@ -3063,7 +3131,7 @@ def test_external_review_comment_queues_implementation_like_internal_pr(tmp_path
     assert github.merged == []
 
 
-def test_external_review_approve_comment_still_follows_internal_implementation_path(tmp_path: Path) -> None:
+def test_external_review_approve_comment_routes_to_final_verdict(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
     service.handle_event(make_pr_event(pr_number=88, action="opened", body="Implements #21"))
     service.wait_for_idle()
@@ -3072,15 +3140,15 @@ def test_external_review_approve_comment_still_follows_internal_implementation_p
     result = service.handle_event(
         make_pr_comment_event(
             pr_number=88,
-            body=f"/approve\n{build_signature(stage='review_round', job=review_job.id, pr=88, round=1)}",
+            body=f"STATUS: READY_FOR_FINAL_VERDICT\n\n{build_signature(stage='review_round', job=review_job.id, pr=88, round=1)}",
         )
     )
     service.wait_for_idle()
 
-    assert result["stage"] == "implementation"
-    assert len(service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=88)) == 1
-    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=88) == []
-    assert omx_runner.launches[-1]["job"].stage == "implementation"
+    assert result["stage"] == "final_verdict"
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=88) == []
+    assert len(service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=88)) == 1
+    assert omx_runner.launches[-1]["job"].stage == "final_verdict"
     assert github.merged == []
 
 
@@ -3142,7 +3210,7 @@ def test_external_review_chain_reaches_final_verdict_like_internal_pr(tmp_path: 
         comment_result = service.handle_event(
             make_pr_comment_event(
                 pr_number=88,
-                body=build_signature(stage="review_round", job=review_job.id, pr=88, round=round_number),
+                body=f"Verdict: changes_requested\n{build_signature(stage='review_round', job=review_job.id, pr=88, round=round_number)}",
             )
         )
         service.wait_for_idle()
@@ -3271,12 +3339,9 @@ def test_review_chain_reaches_verdict_and_merges_on_approve(tmp_path: Path) -> N
             number=77,
             actor_login="agent",
             payload={},
-            body=build_signature(
-                stage="review_round",
-                job=review_job.id,
-                pr=77,
-                round=round_number,
-                issue=5,
+            body=(
+                "Verdict: changes_requested\n"
+                f"{build_signature(stage='review_round', job=review_job.id, pr=77, round=round_number, issue=5)}"
             ),
             title="Feature/#5",
             is_pull_request=True,
@@ -3587,7 +3652,7 @@ def test_duplicate_review_round_event_is_ignored(tmp_path: Path) -> None:
         number=77,
         actor_login="agent",
         payload={},
-        body=build_signature(stage="review_round", job="job-1", pr=77, round=1, issue=5),
+        body=f"Verdict: changes_requested\n{build_signature(stage='review_round', job='job-1', pr=77, round=1, issue=5)}",
         title="Feature/#5",
         is_pull_request=True,
     )

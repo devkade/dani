@@ -115,6 +115,33 @@ def test_implementation_prompt_prefers_push_over_pr_edit_for_existing_pr() -> No
     assert "gh pr edit" not in prompt
 
 
+def test_existing_pr_implementation_prompt_allows_noop_without_comment() -> None:
+    prompt = render_prompt(
+        "implementation",
+        {
+            "repo": "acme/demo",
+            "local_path": "workspace/demo",
+            "issue_number": 7,
+            "issue_title": "Need a bot",
+            "issue_body": "Implement it",
+            "discussion": "approved",
+            "pr_context": "Existing PR context:\nPR #5: Feature/#7",
+            "pr_number": 5,
+            "dev_branch": "dev",
+            "branch_name": "feature/#7",
+            "signature": "<!-- dani:stage=implementation;job=abc;issue=7;pr=5 -->",
+            "signature_instructions": (
+                "  - This is an existing PR follow-up.\n"
+                "  - Write exactly one PR comment that summarizes the fixes and includes this exact signature:\n"
+                "<!-- dani:stage=implementation;job=abc;issue=7;pr=5 -->"
+            ),
+        },
+    )
+
+    assert "If no code, PR body, or branch update was needed, do not post a PR comment" in prompt
+    assert "Post a PR comment only when the follow-up changed code, the PR body, or the branch" in prompt
+
+
 def test_implementation_prompt_creates_first_pr_with_dani_helper() -> None:
     prompt = render_prompt(
         "implementation",
