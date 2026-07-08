@@ -24,7 +24,7 @@ from dani.omx_runner import OmxRunner
 from dani.prompts import NON_INTERACTIVE_GUARD
 from dani.service import DaniService
 from dani.session_bridge import BridgeContext, OmoSessionBridge
-from dani.signatures import build_signature
+from dani.signatures import build_signature, parse_signature
 from dani.storage import JsonStorage
 from dani.work_line import GitWorkLineManager
 from tests.helpers import FakeGitDevSyncer, FakeGitHubCLI, FakeOmxRunner, FakeRuntimeRunner, FakeWorkLineManager
@@ -245,6 +245,13 @@ def make_pr_event(
 
 
 def make_pr_comment_event(*, pr_number: int, body: str, actor_login: str = "agent") -> NormalizedEvent:
+    parsed = parse_signature(body)
+    if parsed is not None:
+        if parsed.get("stage") == "review_round" and not body.lstrip().startswith("STATUS:"):
+            body = f"STATUS: NEEDS_CHANGE\n\n{body}"
+        elif parsed.get("stage") == "final_verdict" and not body.lstrip().startswith("VERDICT:"):
+            verdict = str(parsed.get("verdict") or "APPROVE").upper()
+            body = f"VERDICT: {verdict}\n\n{body}"
     return NormalizedEvent(
         kind="pull_request_comment",
         repo_full_name="acme/demo",
@@ -256,6 +263,99 @@ def make_pr_comment_event(*, pr_number: int, body: str, actor_login: str = "agen
         title=f"Feature/#{pr_number}",
         is_pull_request=True,
     )
+
+
+def test_review_round_ready_status_queues_final_verdict(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+    service.storage.create_job(
+        JobRecord(repo_full_name="acme/demo", stage="review_round", issue_number=5, pr_number=77, review_round=1)
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "STATUS: READY_FOR_FINAL_VERDICT\n\n"
+                f"{build_signature(stage='review_round', job='review-1', pr=77, round=1, issue=5)}"
+            ),
+        )
+    )
+
+    assert result["status"] == "queued"
+    assert result["stage"] == "final_verdict"
+    assert result["review_status"] == "READY_FOR_FINAL_VERDICT"
+    assert len(service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77)) == 1
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=77) == []
+
+
+def test_review_round_blocked_status_does_not_queue_implementation(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+    source_job = service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="review_round",
+            issue_number=5,
+            pr_number=77,
+            review_round=1,
+            metadata={"line_id": "issue-5"},
+        )
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "STATUS: BLOCKED\n\n"
+                f"{build_signature(stage='review_round', job=source_job.id, pr=77, round=1, issue=5)}"
+            ),
+        )
+    )
+
+    assert result == {"status": "blocked", "stage": "review_round", "review_status": "BLOCKED"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=77) == []
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77) == []
+
+def test_malformed_visible_review_status_does_not_fall_back_to_needs_change(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+    service.storage.create_job(
+        JobRecord(repo_full_name="acme/demo", stage="review_round", issue_number=5, pr_number=77, review_round=1)
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "STATUS: NOT_A_STATUS\n\n"
+                "Please fix the unsafe fallback.\n\n"
+                f"{build_signature(stage='review_round', job='review-1', pr=77, round=1, issue=5)}"
+            ),
+        )
+    )
+
+    assert result == {"status": "ignored", "reason": "malformed_review_status"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=77) == []
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77) == []
+
+
+def test_final_verdict_line_must_match_signature_verdict(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "VERDICT: REJECT\n\n"
+                f"{build_signature(stage='final_verdict', job='verdict-1', pr=77, verdict='APPROVE')}"
+            ),
+        )
+    )
+
+    assert result == {"status": "ignored", "reason": "missing_or_mismatched_verdict"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict_merge", pr_number=77) == []
 
 
 def test_issue_readiness_review_persists_omx_session_id(tmp_path: Path) -> None:
@@ -1960,54 +2060,7 @@ def test_review_fix_reuses_original_isolated_work_line(tmp_path: Path) -> None:
     assert work_line.agent_run_ids == [initial_job.session_id, review_job.session_id, review_fix_job.session_id]
 
 
-def test_no_blockers_review_round_routes_to_final_verdict(tmp_path: Path) -> None:
-    service, _, omx_runner = make_service(tmp_path)
-    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
-    service.handle_event(
-        NormalizedEvent(
-            kind="issue_comment",
-            repo_full_name="acme/demo",
-            action="created",
-            number=11,
-            actor_login="acme",
-            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
-            body="/approve",
-            title="Need automation",
-        )
-    )
-    service.wait_for_idle()
-    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
-    service.handle_event(
-        make_pr_comment_event(
-            pr_number=101,
-            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
-        )
-    )
-    service.wait_for_idle()
-    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
-
-    launch_count_before_review_comment = len(omx_runner.launches)
-    result = service.handle_event(
-        make_pr_comment_event(
-            pr_number=101,
-            body=(
-                "Review complete.\n\n"
-                "Bottom line: no_blockers_found\n\n"
-                f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
-            ),
-        )
-    )
-    service.wait_for_idle()
-
-    implementation_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)
-    verdict_jobs = service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101)
-    assert result["stage"] == "final_verdict"
-    assert implementation_jobs == []
-    assert len(verdict_jobs) == 1
-    assert omx_runner.launches[launch_count_before_review_comment]["job"].stage == "final_verdict"
-
-
-def test_changes_requested_review_round_routes_to_implementation(tmp_path: Path) -> None:
+def test_needs_change_review_round_routes_to_implementation(tmp_path: Path) -> None:
     service, _, _ = make_service(tmp_path)
     add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
     service.handle_event(
@@ -2034,7 +2087,7 @@ def test_changes_requested_review_round_routes_to_implementation(tmp_path: Path)
     review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
 
     review_body = (
-        "Verdict: changes_requested\n\n"
+        "STATUS: NEEDS_CHANGE\n\n"
         "- Add coverage for the missing edge case.\n\n"
         f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
     )
@@ -2045,122 +2098,11 @@ def test_changes_requested_review_round_routes_to_implementation(tmp_path: Path)
         -1
     ]
     assert result["stage"] == "implementation"
+    assert result["review_status"] == "NEEDS_CHANGE"
     assert implementation_job.metadata["review_comment_body"] == review_body
+    assert implementation_job.metadata["triggering_review_status"] == "NEEDS_CHANGE"
     assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101) == []
 
-
-def test_mixed_review_round_markers_keep_changes_requested_on_implementation_path(tmp_path: Path) -> None:
-    service, _, _ = make_service(tmp_path)
-    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
-    service.handle_event(
-        NormalizedEvent(
-            kind="issue_comment",
-            repo_full_name="acme/demo",
-            action="created",
-            number=11,
-            actor_login="acme",
-            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
-            body="/approve",
-            title="Need automation",
-        )
-    )
-    service.wait_for_idle()
-    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
-    service.handle_event(
-        make_pr_comment_event(
-            pr_number=101,
-            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
-        )
-    )
-    service.wait_for_idle()
-    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
-
-    review_body = (
-        "Verdict: changes_requested\n\n"
-        "- Blocker: keep this on the implementation path.\n"
-        "- Incidental context: a previous pass said no_blockers_found after /approve.\n\n"
-        f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
-    )
-    result = service.handle_event(make_pr_comment_event(pr_number=101, body=review_body))
-    service.wait_for_idle()
-
-    implementation_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101)[
-        -1
-    ]
-    assert result["stage"] == "implementation"
-    assert implementation_job.metadata["review_comment_body"] == review_body
-    assert implementation_job.metadata["review_round_outcome"] == "changes_requested"
-    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101) == []
-
-
-def test_negated_approval_command_with_blocker_routes_to_implementation(tmp_path: Path) -> None:
-    service, _, _ = make_service(tmp_path)
-
-    review_body = (
-        "Do not use the approval command yet; /approve would be wrong.\nA blocker remains in the worker routing."
-    )
-
-    assert service._classify_review_round_outcome(review_body) == "changes_requested"
-
-
-def test_explicit_no_blockers_verdict_ignores_negated_fix_language(tmp_path: Path) -> None:
-    service, _, _ = make_service(tmp_path)
-
-    review_body = "Bottom line: no_blockers_found\nNo need to fix the worker path; it is verified."
-
-    assert service._classify_review_round_outcome(review_body) == "no_blockers_found"
-
-
-def test_explicit_no_blockers_verdict_ignores_historical_fix_language(tmp_path: Path) -> None:
-    service, _, _ = make_service(tmp_path)
-
-    review_body = "Verdict: no_blockers_found\nPrevious review said must fix routing, now resolved."
-
-    assert service._classify_review_round_outcome(review_body) == "no_blockers_found"
-
-
-def test_unclear_review_round_does_not_launch_worker(tmp_path: Path) -> None:
-    service, _, omx_runner = make_service(tmp_path)
-    add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
-    service.handle_event(
-        NormalizedEvent(
-            kind="issue_comment",
-            repo_full_name="acme/demo",
-            action="created",
-            number=11,
-            actor_login="acme",
-            payload={"issue": {"body": "context"}, "comment": {"id": 1, "author_association": "OWNER"}},
-            body="/approve",
-            title="Need automation",
-        )
-    )
-    service.wait_for_idle()
-    initial_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", issue_number=11)[0]
-    service.handle_event(
-        make_pr_comment_event(
-            pr_number=101,
-            body=build_signature(stage="implementation", job=initial_job.id, pr=101, issue=11),
-        )
-    )
-    service.wait_for_idle()
-    review_job = service.storage.find_jobs(repo_full_name="acme/demo", stage="review_round", pr_number=101)[0]
-    launch_count_before_review_comment = len(omx_runner.launches)
-
-    result = service.handle_event(
-        make_pr_comment_event(
-            pr_number=101,
-            body=(
-                "Review pass complete; see notes above.\n\n"
-                f"{build_signature(stage='review_round', job=review_job.id, pr=101, round=1)}"
-            ),
-        )
-    )
-    service.wait_for_idle()
-
-    assert result == {"status": "ignored", "reason": "unclear_review_verdict"}
-    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=101) == []
-    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=101) == []
-    assert len(omx_runner.launches) == launch_count_before_review_comment
 
 
 def test_queued_implementation_skips_launch_when_pr_closed(tmp_path: Path) -> None:
@@ -2189,7 +2131,6 @@ def test_queued_implementation_skips_launch_when_pr_closed(tmp_path: Path) -> No
 
     assert omx_runner.launches == []
     assert job.metadata["skip_reason"] == "pr_not_open"
-
 
 def test_review_fix_loop_repeats_in_same_work_line_until_final_approval(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
@@ -3230,7 +3171,7 @@ def test_external_review_approve_comment_routes_to_final_verdict(tmp_path: Path)
     result = service.handle_event(
         make_pr_comment_event(
             pr_number=88,
-            body=f"/approve\n{build_signature(stage='review_round', job=review_job.id, pr=88, round=1)}",
+            body=f"STATUS: READY_FOR_FINAL_VERDICT\n\n{build_signature(stage='review_round', job=review_job.id, pr=88, round=1)}",
         )
     )
     service.wait_for_idle()
@@ -3842,6 +3783,49 @@ def test_duplicate_final_verdict_event_is_ignored(tmp_path: Path) -> None:
     assert len(resolution_jobs) == 1
     assert omx_runner.launches[-1]["job"].stage == "merge_conflict_resolution"
     assert omx_runner.launches[-1]["job"].pr_number == 77
+
+
+def test_malformed_visible_final_verdict_does_not_fall_back_to_hidden_approve(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    github.add_pull_request(
+        "acme/demo",
+        77,
+        "Implements #5",
+        title="Feature/#5",
+    )
+    service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="review_round",
+            issue_number=5,
+            pr_number=77,
+            review_round=1,
+            status="completed",
+        )
+    )
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="pull_request_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=77,
+            actor_login="acme",
+            payload={},
+            body=(
+                "VERDICT: REJECTED\n\n"
+                f"{build_signature(stage='final_verdict', job='verdict-1', pr=77, verdict='APPROVE')}"
+            ),
+            title="Feature/#5",
+            is_pull_request=True,
+        )
+    )
+    service.wait_for_idle()
+
+    assert result == {"status": "ignored", "reason": "malformed_final_verdict"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict_merge", pr_number=77) == []
+    assert github.merged == []
+    assert omx_runner.launches == []
 
 
 def test_final_verdict_event_enqueues_merge_job_without_waiting_for_running_repo_job(tmp_path: Path) -> None:

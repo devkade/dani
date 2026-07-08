@@ -14,6 +14,18 @@ from dani.work_line import WorkLineContext
 _CAPACITY_MSG = "capacity"
 
 
+def _with_status_prefix(body: str) -> str:
+    parsed = parse_signature(body)
+    if parsed is None:
+        return body
+    if parsed.get("stage") == "review_round" and not body.lstrip().startswith("STATUS:"):
+        return f"STATUS: NEEDS_CHANGE\n\n{body}"
+    if parsed.get("stage") == "final_verdict" and not body.lstrip().startswith("VERDICT:"):
+        verdict = str(parsed.get("verdict") or "APPROVE").upper()
+        return f"VERDICT: {verdict}\n\n{body}"
+    return body
+
+
 class FakeGitHubCLI:
     def __init__(self) -> None:
         self.issue_comment_map: dict[tuple[str, int], list[dict[str, Any]]] = {}
@@ -116,7 +128,7 @@ class FakeGitHubCLI:
         self.issue_comment_map.setdefault((repo_full_name, issue_number), []).append(self._allocate_comment(signature))
 
     def add_pr_signature(self, repo_full_name: str, pr_number: int, signature: str) -> None:
-        self.pr_comment_map.setdefault((repo_full_name, pr_number), []).append(self._allocate_comment(signature))
+        self.pr_comment_map.setdefault((repo_full_name, pr_number), []).append(self._allocate_comment(_with_status_prefix(signature)))
 
     def create_issue_comment(self, repo_full_name: str, issue_number: int, body: str) -> dict[str, Any]:
         comment = self._allocate_comment(body)
