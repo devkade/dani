@@ -29,10 +29,13 @@ from dani.models import (
     ISSUE_READY_LAUNCH_MODES,
     DaniConfig,
 )
+from dani.queue_inspection import build_queue_report, inspect_job, render_inspect_text, render_status_text
 from dani.server import create_app
 from dani.service import DaniService
 
 app = typer.Typer(help="Simple GitHub webhook -> OMX automation loop.")
+queue_app = typer.Typer(help="Inspect queue health and route decisions.")
+app.add_typer(queue_app, name="queue")
 DEFAULT_DATA_DIR = Path.home() / ".dani"
 DATA_DIR_OPTION = typer.Option(DEFAULT_DATA_DIR, help="Directory for dani state files.")
 HOST_OPTION = typer.Option("127.0.0.1", help="Bind host.")
@@ -259,6 +262,58 @@ def restart_issue(
     job = service.restart_issue(repo_full_name, issue_number)
     service.wait_for_idle()
     typer.echo(json.dumps(job.to_dict(), ensure_ascii=False, indent=2))
+
+
+@app.command("status")
+def status(data_dir: Path = DATA_DIR_OPTION) -> None:
+    """Print human-readable queue health."""
+    typer.echo(render_status_text(build_queue_report(data_dir)))
+
+
+@queue_app.command("status")
+def queue_status(data_dir: Path = DATA_DIR_OPTION) -> None:
+    """Print human-readable queue health."""
+    typer.echo(render_status_text(build_queue_report(data_dir)))
+
+
+@queue_app.command("doctor")
+def queue_doctor(
+    data_dir: Path = DATA_DIR_OPTION,
+    json_output: bool = typer.Option(False, "--json", "-j", help="Emit JSON instead of text."),
+    stuck_age_seconds: int = typer.Option(3600, "--stuck-age-seconds", help="Active job stuck threshold."),
+) -> None:
+    """Run queue-specific health and routing invariant checks."""
+    report = build_queue_report(data_dir, stuck_age_seconds=stuck_age_seconds)
+    if json_output:
+        typer.echo(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        typer.echo(render_status_text(report))
+    if report["health"] == "fail":
+        raise typer.Exit(2)
+    if report["health"] == "warn":
+        raise typer.Exit(1)
+
+
+inspect_app = typer.Typer(help="Inspect persisted Dani records.")
+app.add_typer(inspect_app, name="inspect")
+
+
+@inspect_app.command("job")
+def inspect_job_command(
+    job_id: str = typer.Argument(..., help="Job id to inspect."),
+    data_dir: Path = DATA_DIR_OPTION,
+    json_output: bool = typer.Option(False, "--json", "-j", help="Emit JSON instead of text."),
+) -> None:
+    """Inspect one persisted job with route and session metadata."""
+    try:
+        detail = inspect_job(data_dir, job_id)
+    except KeyError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(json.dumps(detail, ensure_ascii=False, indent=2))
+    else:
+        typer.echo(render_inspect_text(detail))
 
 
 DOCTOR_JSON_OPTION = typer.Option(False, "--json", "-j", help="Emit JSON instead of text.")

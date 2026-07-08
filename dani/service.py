@@ -708,6 +708,13 @@ class DaniService:
                     **lineage_metadata,
                     "title": (pr_metadata.get("title") or event.title or ""),
                 },
+                route_reason="implementation_review_limit_reached",
+                source_event=self._source_event_metadata(event, signature=signature),
+                route_decision={
+                    "from": "implementation",
+                    "to": "final_verdict",
+                    "because": "review round limit reached after implementation event",
+                },
             )
             return {"status": "queued", "job_id": verdict_job.id, "stage": verdict_job.stage}
 
@@ -722,6 +729,13 @@ class DaniService:
                 **pr_metadata,
                 **lineage_metadata,
                 "title": (pr_metadata.get("title") or event.title or ""),
+            },
+            route_reason="implementation_agent_event",
+            source_event=self._source_event_metadata(event, signature=signature),
+            route_decision={
+                "from": "implementation",
+                "to": "review_round",
+                "because": "implementation agent event queued next review round",
             },
         )
         return {"status": "queued", "job_id": review_job.id, "stage": review_job.stage}
@@ -1056,6 +1070,13 @@ class DaniService:
                 "triggering_review_round": review_round,
                 "review_round_outcome": review_outcome,
             },
+            route_reason="review_round_changes_requested",
+            source_event=self._source_event_metadata(event, signature=signature),
+            route_decision={
+                "from": "review_round",
+                "to": "implementation",
+                "because": "review requested changes",
+            },
         )
         return {"status": "queued", "job_id": next_job.id, "stage": next_job.stage}
 
@@ -1071,10 +1092,34 @@ class DaniService:
         role: str | None = None,
         route_reason: str | None = None,
         target_metadata: dict[str, Any] | None = None,
+        source_event: dict[str, Any] | None = None,
+        route_decision: dict[str, Any] | None = None,
     ) -> JobRecord:
         resolved_role = role or default_role_for_stage(stage)
         binding = self._role_binding(resolved_role)
-        role_metadata = self._job_role_metadata(binding, route_reason=route_reason, target_metadata=target_metadata)
+        if source_event is None and target_metadata:
+            source_event = {
+                "kind": target_metadata.get("event_kind"),
+                "action": target_metadata.get("event_action"),
+                "number": target_metadata.get("target_number")
+                or target_metadata.get("issue_number")
+                or target_metadata.get("pr_number"),
+                "delivery_id": target_metadata.get("delivery_id"),
+            }
+            source_event = {key: value for key, value in source_event.items() if value is not None}
+        if route_decision is None and route_reason:
+            route_decision = {
+                "from": source_event.get("kind") if source_event else None,
+                "to": stage,
+                "because": route_reason,
+            }
+        role_metadata = self._job_role_metadata(
+            binding,
+            route_reason=route_reason,
+            target_metadata=target_metadata,
+            source_event=source_event,
+            route_decision=route_decision,
+        )
         job = JobRecord(
             repo_full_name=repo.full_name,
             stage=stage,
@@ -1509,7 +1554,41 @@ class DaniService:
             "role": decision.role,
             "route_reason": decision.reason,
             "target_metadata": decision.target_metadata,
+            "source_event": self._source_event_metadata(event),
+            "route_decision": {
+                "from": event.kind,
+                "to": decision.stage,
+                "because": decision.reason,
+            },
         }
+
+    def _source_event_metadata(
+        self, event: NormalizedEvent, *, signature: dict[str, str] | None = None
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "kind": event.kind,
+            "action": event.action,
+            "number": event.number,
+            "actor_login": event.actor_login,
+        }
+        if event.delivery_id:
+            metadata["delivery_id"] = event.delivery_id
+        if event.is_pull_request:
+            metadata["pr"] = event.number
+        if event.issue_state:
+            metadata["issue_state"] = event.issue_state
+        if event.pr_state:
+            metadata["pr_state"] = event.pr_state
+        if event.pr_merged is not None:
+            metadata["pr_merged"] = event.pr_merged
+        if signature:
+            metadata["signature_stage"] = signature.get("stage")
+            metadata["signature_job"] = signature.get("job")
+            metadata["signature_pr"] = signature.get("pr")
+            metadata["signature_issue"] = signature.get("issue")
+            metadata["review_verdict"] = signature.get("verdict") or signature.get("status")
+            metadata["signature_round"] = signature.get("round")
+        return metadata
 
     def _role_binding(self, role: str | None) -> AgentRoleBinding:
         role_name = role or default_role_for_stage("")
@@ -1525,6 +1604,8 @@ class DaniService:
         *,
         route_reason: str | None = None,
         target_metadata: dict[str, Any] | None = None,
+        source_event: dict[str, Any] | None = None,
+        route_decision: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
             "role": binding.role,
@@ -1537,6 +1618,10 @@ class DaniService:
             metadata["route_reason"] = route_reason
         if target_metadata:
             metadata["target"] = dict(target_metadata)
+        if source_event:
+            metadata["source_event"] = dict(source_event)
+        if route_decision:
+            metadata["route_decision"] = dict(route_decision)
         return metadata
 
     def _role_prompt_context(self, job: JobRecord) -> str:
@@ -3204,7 +3289,13 @@ class DaniService:
                     "body": event.body or "",
                     "pr_review_state": "review_round_1_pending",
                 },
-                **self._route_kwargs(event),
+                route_reason="implementation_pr_opened",
+                source_event=self._source_event_metadata(event, signature=signature),
+                route_decision={
+                    "from": "implementation",
+                    "to": "review_round",
+                    "because": "implementation PR event queued review round",
+                },
             )
             return {"status": "queued", "job_id": job.id, "stage": job.stage}
 

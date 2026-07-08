@@ -269,3 +269,156 @@ def test_build_config_rejects_zero_repo_concurrency(tmp_path: Path, monkeypatch)
 
     with pytest.raises(cli_module.typer.BadParameter):
         cli_module.build_config(data_dir)
+
+
+def _write_queue_state(data_dir: Path, *, jobs: list[dict]) -> None:
+    data_dir.mkdir(parents=True)
+    (data_dir / "registry.json").write_text(json.dumps({"repos": [{"full_name": "acme/demo"}]}), encoding="utf-8")
+    (data_dir / "jobs.json").write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+    (data_dir / "sessions.json").write_text(json.dumps({"sessions": []}), encoding="utf-8")
+    (data_dir / "work-lines.json").write_text(json.dumps({"work_lines": []}), encoding="utf-8")
+    (data_dir / "processed-events.json").write_text(json.dumps({"keys": []}), encoding="utf-8")
+    (data_dir / "terminal-targets.json").write_text(json.dumps({"prs": [], "issues": []}), encoding="utf-8")
+
+
+def test_status_command_prints_queue_health(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / ".dani"
+    _write_queue_state(
+        data_dir,
+        jobs=[
+            {
+                "id": "job-1",
+                "repo_full_name": "acme/demo",
+                "stage": "implementation",
+                "role": "worker",
+                "issue_number": 16,
+                "pr_number": None,
+                "review_round": None,
+                "metadata": {"route_reason": "issue_comment_approve"},
+                "status": "queued",
+                "session_id": None,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "updated_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+    )
+
+    result = runner.invoke(app, ["status", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 0
+    assert "Dani queue health" in result.stdout
+    assert "- queued: 1" in result.stdout
+    assert "issue_comment_approve" in result.stdout
+
+
+def test_queue_doctor_json_reports_failures(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / ".dani"
+    _write_queue_state(
+        data_dir,
+        jobs=[
+            {
+                "id": "job-1",
+                "repo_full_name": "acme/demo",
+                "stage": "implementation",
+                "role": "reviewer",
+                "issue_number": 16,
+                "pr_number": None,
+                "review_round": None,
+                "metadata": {},
+                "status": "queued",
+                "session_id": None,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "updated_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+    )
+
+    result = runner.invoke(app, ["queue", "doctor", "--json", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stdout)
+    assert payload["health"] == "fail"
+    assert payload["failures"][0]["code"] == "role_binding_mismatch"
+
+
+def test_queue_doctor_json_reports_warning_exit(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / ".dani"
+    _write_queue_state(
+        data_dir,
+        jobs=[
+            {
+                "id": "job-1",
+                "repo_full_name": "acme/demo",
+                "stage": "implementation",
+                "role": "worker",
+                "issue_number": 16,
+                "pr_number": None,
+                "review_round": None,
+                "metadata": {},
+                "status": "queued",
+                "session_id": None,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "updated_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+    )
+
+    result = runner.invoke(app, ["queue", "doctor", "--json", "--data-dir", str(data_dir), "--stuck-age-seconds", "0"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["health"] == "warn"
+    assert payload["warnings"][0]["code"] == "active_job_stuck"
+
+
+def test_inspect_job_command_reports_unknown_job(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / ".dani"
+    _write_queue_state(data_dir, jobs=[])
+
+    result = runner.invoke(app, ["inspect", "job", "missing", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 1
+    assert "Unknown job id: missing" in result.stderr
+
+
+def test_inspect_job_command_prints_route_metadata(tmp_path: Path) -> None:
+    runner = CliRunner()
+    data_dir = tmp_path / ".dani"
+    _write_queue_state(
+        data_dir,
+        jobs=[
+            {
+                "id": "job-1",
+                "repo_full_name": "acme/demo",
+                "stage": "implementation",
+                "role": "worker",
+                "issue_number": 16,
+                "pr_number": 4,
+                "review_round": 1,
+                "metadata": {
+                    "route_reason": "review_round_changes_requested",
+                    "source_event": {"kind": "issue_comment", "signature_stage": "review_round"},
+                    "route_decision": {
+                        "from": "review_round",
+                        "to": "implementation",
+                        "because": "review requested changes",
+                    },
+                },
+                "status": "queued",
+                "session_id": None,
+                "created_at": "2026-06-20T00:00:00+00:00",
+                "updated_at": "2026-06-20T00:00:00+00:00",
+            }
+        ],
+    )
+
+    result = runner.invoke(app, ["inspect", "job", "job-1", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 0
+    assert "Dani job job-1" in result.stdout
+    assert "route_reason: review_round_changes_requested" in result.stdout
+    assert '"to": "implementation"' in result.stdout
