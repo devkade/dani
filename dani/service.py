@@ -92,6 +92,7 @@ ALLOWED_REVIEW_STATUSES = frozenset(
     }
 )
 ALLOWED_FINAL_VERDICTS = frozenset({"APPROVE", "REJECT"})
+INVALID_PREFIXED_COMMENT_VALUE = "__INVALID_PREFIXED_COMMENT_VALUE__"
 
 
 class DaniService:
@@ -664,10 +665,12 @@ class DaniService:
         if not line.upper().startswith(expected_prefix):
             return None
         value = line[len(expected_prefix) :].strip().upper().replace("-", "_").replace(" ", "_")
-        return value if value in allowed else None
+        return value if value in allowed else INVALID_PREFIXED_COMMENT_VALUE
 
     def _review_status_from_event(self, event: NormalizedEvent, signature: dict[str, str]) -> str | None:
         status = self._parse_prefixed_comment_value(event.body, "STATUS", ALLOWED_REVIEW_STATUSES)
+        if status == INVALID_PREFIXED_COMMENT_VALUE:
+            return status
         signature_status = str(signature.get("status") or "").strip().upper().replace("-", "_").replace(" ", "_")
         if signature_status and signature_status in ALLOWED_REVIEW_STATUSES:
             if status is not None and status != signature_status:
@@ -677,6 +680,8 @@ class DaniService:
 
     def _final_verdict_from_event(self, event: NormalizedEvent, signature: dict[str, str]) -> str | None:
         verdict = self._parse_prefixed_comment_value(event.body, "VERDICT", ALLOWED_FINAL_VERDICTS)
+        if verdict == INVALID_PREFIXED_COMMENT_VALUE:
+            return verdict
         signature_verdict = str(signature.get("verdict") or "").strip().upper()
         if signature_verdict and signature_verdict in ALLOWED_FINAL_VERDICTS:
             if verdict is not None and verdict != signature_verdict:
@@ -686,6 +691,8 @@ class DaniService:
 
     def _handle_final_verdict_comment_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         verdict = self._final_verdict_from_event(event, signature)
+        if verdict == INVALID_PREFIXED_COMMENT_VALUE:
+            return {"status": "ignored", "reason": "malformed_final_verdict"}
         if verdict is None:
             return {"status": "ignored", "reason": "missing_or_mismatched_verdict"}
         if verdict == "APPROVE":
@@ -717,6 +724,8 @@ class DaniService:
             return {"status": "ignored", "reason": "retarget_request_no_action"}
 
         return {"status": "updated", "stage": stage}
+
+
 
     def _handle_implementation_agent_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         pr_number = int(signature.get("pr") or event.number)
@@ -1008,9 +1017,12 @@ class DaniService:
         self._update_work_line_state(source_job, status="merged", auto_merge_state="merged", retryable=False)
         self._cleanup_work_line_after_merge(source_job)
 
+
     def _handle_review_round_event(self, event: NormalizedEvent, signature: dict[str, str]) -> dict[str, Any]:
         event_key = self._agent_event_key(signature, default_pr=event.number if event.is_pull_request else None)
         review_status = self._review_status_from_event(event, signature)
+        if review_status == INVALID_PREFIXED_COMMENT_VALUE:
+            return {"status": "ignored", "reason": "malformed_review_status"}
         if review_status is None:
             return {"status": "ignored", "reason": "missing_or_mismatched_review_status"}
         if not self.storage.record_processed_event(event_key):

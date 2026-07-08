@@ -440,6 +440,10 @@ def test_review_round_prompt_requires_code_review_and_verification() -> None:
     assert "actual verification" in prompt.lower()
     assert "concrete evidence appropriate for what you verified" in prompt
     assert "gh pr comment 5 --repo acme/demo --body-file <review-comment.md>" in prompt
+    assert "STATUS: NEEDS_CHANGE" in prompt
+    assert "STATUS: READY_FOR_FINAL_VERDICT" in prompt
+    assert "STATUS: BLOCKED" in prompt
+    assert "STATUS: INCONCLUSIVE" in prompt
 
 
 def test_review_round_prompt_for_omo_delegates_to_momus_plan_critic() -> None:

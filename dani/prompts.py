@@ -225,6 +225,11 @@ $discussion
 $review_mode_note
 $runtime_stage_instructions
 Use the code locally and run $$code-review before writing the review comment.
+Start the PR comment with exactly one of these top-line statuses:
+- STATUS: NEEDS_CHANGE
+- STATUS: READY_FOR_FINAL_VERDICT
+- STATUS: BLOCKED
+- STATUS: INCONCLUSIVE
 Do real verification, not only static inspection.
 The first non-empty line of your PR comment MUST be exactly one of:
 STATUS: NEEDS_CHANGE
@@ -296,6 +301,9 @@ Review history:
 $discussion
 
 $runtime_stage_instructions
+Start the PR comment with exactly one of these top-line verdicts:
+- VERDICT: APPROVE
+- VERDICT: REJECT
 Leave exactly one GitHub PR comment for this review pass.
 The first non-empty line of your PR comment MUST be exactly one of:
 VERDICT: APPROVE

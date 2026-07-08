@@ -317,6 +317,28 @@ def test_review_round_blocked_status_does_not_queue_implementation(tmp_path: Pat
     assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=77) == []
     assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77) == []
 
+def test_malformed_visible_review_status_does_not_fall_back_to_needs_change(tmp_path: Path) -> None:
+    service, _, _ = make_service(tmp_path)
+    service.register_repo("acme/demo", str(tmp_path))
+    service.storage.create_job(
+        JobRecord(repo_full_name="acme/demo", stage="review_round", issue_number=5, pr_number=77, review_round=1)
+    )
+
+    result = service.handle_event(
+        make_pr_comment_event(
+            pr_number=77,
+            body=(
+                "STATUS: NOT_A_STATUS\n\n"
+                "Please fix the unsafe fallback.\n\n"
+                f"{build_signature(stage='review_round', job='review-1', pr=77, round=1, issue=5)}"
+            ),
+        )
+    )
+
+    assert result == {"status": "ignored", "reason": "malformed_review_status"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="implementation", pr_number=77) == []
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict", pr_number=77) == []
+
 
 def test_final_verdict_line_must_match_signature_verdict(tmp_path: Path) -> None:
     service, _, _ = make_service(tmp_path)
@@ -2024,6 +2046,7 @@ def test_review_fix_reuses_original_isolated_work_line(tmp_path: Path) -> None:
     assert work_line.agent_run_ids == [initial_job.session_id, review_job.session_id, review_fix_job.session_id]
 
 
+
 def test_review_fix_loop_repeats_in_same_work_line_until_final_approval(tmp_path: Path) -> None:
     service, github, omx_runner = make_service(tmp_path)
     add_ready_issue_signature(cast(FakeGitHubCLI, service.github), "acme/demo", 11)
@@ -3664,6 +3687,49 @@ def test_duplicate_final_verdict_event_is_ignored(tmp_path: Path) -> None:
     assert len(resolution_jobs) == 1
     assert omx_runner.launches[-1]["job"].stage == "merge_conflict_resolution"
     assert omx_runner.launches[-1]["job"].pr_number == 77
+
+
+def test_malformed_visible_final_verdict_does_not_fall_back_to_hidden_approve(tmp_path: Path) -> None:
+    service, github, omx_runner = make_service(tmp_path)
+    github.add_pull_request(
+        "acme/demo",
+        77,
+        "Implements #5",
+        title="Feature/#5",
+    )
+    service.storage.create_job(
+        JobRecord(
+            repo_full_name="acme/demo",
+            stage="review_round",
+            issue_number=5,
+            pr_number=77,
+            review_round=1,
+            status="completed",
+        )
+    )
+
+    result = service.handle_event(
+        NormalizedEvent(
+            kind="pull_request_comment",
+            repo_full_name="acme/demo",
+            action="created",
+            number=77,
+            actor_login="acme",
+            payload={},
+            body=(
+                "VERDICT: REJECTED\n\n"
+                f"{build_signature(stage='final_verdict', job='verdict-1', pr=77, verdict='APPROVE')}"
+            ),
+            title="Feature/#5",
+            is_pull_request=True,
+        )
+    )
+    service.wait_for_idle()
+
+    assert result == {"status": "ignored", "reason": "malformed_final_verdict"}
+    assert service.storage.find_jobs(repo_full_name="acme/demo", stage="final_verdict_merge", pr_number=77) == []
+    assert github.merged == []
+    assert omx_runner.launches == []
 
 
 def test_final_verdict_event_enqueues_merge_job_without_waiting_for_running_repo_job(tmp_path: Path) -> None:
